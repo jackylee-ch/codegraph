@@ -6,6 +6,7 @@
 
 import type CodeGraph from '../index';
 import type { QueryPool } from './query-pool';
+import type { MemoryGovernor } from './memory-governor';
 import { findNearestCodeGraphRoot } from '../directory';
 // Lazy-load the heavy CodeGraph chain off the MCP startup path — see the same
 // helper in engine.ts. ToolHandler must load to answer tools/list (static
@@ -1364,6 +1365,9 @@ export class ToolHandler {
   // Insertion-ordered: a hit re-inserts, so the head is always the LRU.
   // Bounded by count AND idle age — see PROJECT_CACHE_LIMITS.
   private projectCache: Map<string, CachedProject> = new Map();
+  // Per-process memory budget enforcer, injected by the server (null for
+  // library/CLI callers, which are short-lived and need no governing).
+  private memoryGovernor: MemoryGovernor | null = null;
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -2079,8 +2083,7 @@ export class ToolHandler {
     args: Record<string, unknown>,
     sessionState?: ExploreSessionState,
   ): Promise<ToolResult> {
-    try {
-      // Block the first tool call on the engine's post-open reconcile so we
+    try {      // Block the first tool call on the engine's post-open reconcile so we
       // never serve rows for files deleted/edited while no MCP server was
       // running. The wait is time-boxed (#905): a huge-repo reconcile takes
       // minutes, and blocking the first call on all of it reads as a hang, so
@@ -2172,6 +2175,54 @@ export class ToolHandler {
         'This is an internal codegraph error — retry the call once; if it persists, ' +
         'continue without codegraph for this task.'
       );
+    } finally {
+      // Enforce the process memory budget here and nowhere else: this is the one
+      // point where a request has definitely finished, memory has just moved, and
+      // nobody is waiting on us. In `finally` so a failed call is governed too —
+      // an error path can allocate as much as a successful one.
+      //
+      // Under the high-water mark this is two cheap reads. A timer was
+      // deliberately NOT used: a repeating interval keeps the event loop alive and
+      // defeats the daemon's own idle-exit.
+      this.governMemory();
+    }
+  }
+
+  /**
+   * Install the memory governor. The server owns the policy (what may be dropped,
+   * what a ceiling breach does), so it injects a configured governor rather than
+   * having the tool layer decide. Unset (the default for library/CLI callers)
+   * means no governing at all — a short-lived process does not need it.
+   */
+  setMemoryGovernor(governor: MemoryGovernor | null): void {
+    this.memoryGovernor = governor;
+  }
+
+  /**
+   * Drop everything droppable, for the governor's evict step.
+   *
+   * Closes every cached cross-project connection — each carries a 64 MB page cache
+   * and a 256 MB mmap window — and clears the worktree-mismatch memo. The DEFAULT
+   * project's connection is owned by the server and is deliberately NOT closed:
+   * the process is still serving it, and reopening it under memory pressure would
+   * cost more than it frees. Callers re-open evicted projects on their next query.
+   */
+  releaseCachedProjects(): void {
+    for (const [root, entry] of [...this.projectCache]) {
+      this.projectCache.delete(root);
+      this.closeCached(entry, root, 'lru');
+    }
+    this.worktreeMismatchCache.clear();
+  }
+
+  /** Run one governor pass; never lets a bookkeeping problem fail a tool call. */
+  private governMemory(): void {
+    const governor = this.memoryGovernor;
+    if (!governor || !governor.enabled) return;
+    try {
+      governor.check();
+    } catch {
+      // The governor is a guard rail, not part of the answer.
     }
   }
 
