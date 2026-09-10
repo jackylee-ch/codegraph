@@ -425,7 +425,7 @@ describe('Database Layer Improvements', () => {
   });
 
   it.skipIf(!HAS_SQLITE)('should set performance pragmas on initialization', async () => {
-    const { DatabaseConnection } = await import('../src/db');
+    const { DatabaseConnection, CONNECTION_MEMORY_DEFAULTS } = await import('../src/db');
 
     const dbPath = path.join(testDir, 'codegraph.db');
     const db = DatabaseConnection.initialize(dbPath);
@@ -435,14 +435,29 @@ describe('Database Layer Improvements', () => {
     const synchronous = rawDb.pragma('synchronous', { simple: true });
     expect(synchronous).toBe(1); // NORMAL = 1
 
+    // Asserted against the shared defaults rather than literals: both are now
+    // env-overridable and both were retuned on measurement — the page cache DOWN
+    // (it is real charged memory, in malloc arenas) and the mmap window UP (its
+    // pages measured dirty=0, so it costs ~nothing while being worth 30-57% of
+    // query latency). Pinning literals here would make every future retune look
+    // like a regression.
     const cacheSize = rawDb.pragma('cache_size', { simple: true }) as number;
-    expect(cacheSize).toBe(-64000);
+    expect(cacheSize).toBe(-CONNECTION_MEMORY_DEFAULTS.CACHE_MB * 1000);
 
     const tempStore = rawDb.pragma('temp_store', { simple: true });
     expect(tempStore).toBe(2); // MEMORY = 2
 
+    // SQLite rounds mmap_size DOWN to a whole number of pages, so this is a
+    // range rather than an equality (2048 MB comes back as 2147418112, one 64 KiB
+    // page short of 2147483648).
+    const wantMmap = CONNECTION_MEMORY_DEFAULTS.MMAP_MB * 1024 * 1024;
     const mmapSize = rawDb.pragma('mmap_size', { simple: true }) as number;
-    expect(mmapSize).toBe(268435456); // 256 MB
+    expect(mmapSize).toBeLessThanOrEqual(wantMmap);
+    expect(mmapSize).toBeGreaterThan(wantMmap - 1024 * 1024);
+
+    // …and the direction of each is itself part of the contract.
+    expect(CONNECTION_MEMORY_DEFAULTS.CACHE_MB).toBeLessThanOrEqual(32);
+    expect(CONNECTION_MEMORY_DEFAULTS.MMAP_MB).toBeGreaterThanOrEqual(1024);
 
     db.close();
   });

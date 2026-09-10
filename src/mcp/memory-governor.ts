@@ -165,13 +165,46 @@ export function __setRssBaselineForTests(bytes: number | null): void {
   rssBaselineBytes = bytes;
 }
 
+/**
+ * Resident bytes from SQLite's memory-mapped window, which the budget must NOT
+ * charge for.
+ *
+ * Measured on a 460k-node index with `mmap_size = 1 GB`: `vmmap` reports the
+ * `mapped file` region at 1.0 GB of address space with **656 MB resident and
+ * 0 KB dirty**, while the process's physical footprint reads 304.6 MB — the OS
+ * excludes those pages from what it charges the process entirely, because they
+ * are clean, file-backed page cache the kernel can drop at zero cost.
+ *
+ * `process.memoryUsage().rss` counts them anyway. Governing on raw rss therefore
+ * penalised a mapping that costs nothing, and the only way to satisfy the budget
+ * was `mmap_size = 0` — which made every query re-read pages through syscalls and
+ * cost **30–57% latency** (median 2034 ms at mmap=0 vs 1226 ms at mmap=2048 on the
+ * same queries). That is a measurement error paid for in wall-clock.
+ *
+ * So the configured mmap size is subtracted from resident growth. It is an upper
+ * bound on what mmap can contribute (resident ≤ mapped), so this can under-count
+ * the mapping's share but never over-count it — and the floor at 0 keeps the
+ * result honest when growth is smaller than the allowance.
+ */
+function mmapAllowanceBytes(): number {
+  try {
+    // Required lazily: db/index.ts pulls in the sqlite layer, and the governor is
+    // constructed on the daemon's startup path where that is not yet wanted.
+    const { resolveConnectionMemory } = require('../db') as typeof import('../db');
+    return Math.max(0, resolveConnectionMemory().mmapMb) * MB;
+  } catch {
+    return 0;
+  }
+}
+
 /** Read the current committed/live/resident numbers. */
 export function readMemory(): MemoryReading {
   const h = v8.getHeapStatistics();
   const m = process.memoryUsage();
   if (rssBaselineBytes === null) rssBaselineBytes = m.rss;
   const committedJsBytes = h.total_heap_size + (h.external_memory ?? 0) + m.arrayBuffers;
-  const rssGrowthBytes = Math.max(0, m.rss - rssBaselineBytes);
+  const rawGrowth = Math.max(0, m.rss - rssBaselineBytes);
+  const rssGrowthBytes = Math.max(0, rawGrowth - mmapAllowanceBytes());
   return {
     governedBytes: Math.max(committedJsBytes, rssGrowthBytes),
     committedJsBytes,
