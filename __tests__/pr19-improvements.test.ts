@@ -425,7 +425,7 @@ describe('Database Layer Improvements', () => {
   });
 
   it.skipIf(!HAS_SQLITE)('should set performance pragmas on initialization', async () => {
-    const { DatabaseConnection, CONNECTION_MEMORY_DEFAULTS } = await import('../src/db');
+    const { DatabaseConnection, CONNECTION_MEMORY_DEFAULTS, clampConnectionMemory } = await import('../src/db');
 
     const dbPath = path.join(testDir, 'codegraph.db');
     const db = DatabaseConnection.initialize(dbPath);
@@ -435,12 +435,9 @@ describe('Database Layer Improvements', () => {
     const synchronous = rawDb.pragma('synchronous', { simple: true });
     expect(synchronous).toBe(1); // NORMAL = 1
 
-    // Asserted against the shared defaults rather than literals: both are now
-    // env-overridable and both were retuned on measurement — the page cache DOWN
-    // (it is real charged memory, in malloc arenas) and the mmap window UP (its
-    // pages measured dirty=0, so it costs ~nothing while being worth 30-57% of
-    // query latency). Pinning literals here would make every future retune look
-    // like a regression.
+    // Asserted against the shared defaults rather than literals: both are
+    // env-overridable and both have been retuned on measurement, so pinning
+    // literals here would make every future retune look like a regression.
     const cacheSize = rawDb.pragma('cache_size', { simple: true }) as number;
     expect(cacheSize).toBe(-CONNECTION_MEMORY_DEFAULTS.CACHE_MB * 1000);
 
@@ -448,16 +445,19 @@ describe('Database Layer Improvements', () => {
     expect(tempStore).toBe(2); // MEMORY = 2
 
     // SQLite rounds mmap_size DOWN to a whole number of pages, so this is a
-    // range rather than an equality (2048 MB comes back as 2147418112, one 64 KiB
-    // page short of 2147483648).
+    // range rather than an equality.
     const wantMmap = CONNECTION_MEMORY_DEFAULTS.MMAP_MB * 1024 * 1024;
     const mmapSize = rawDb.pragma('mmap_size', { simple: true }) as number;
     expect(mmapSize).toBeLessThanOrEqual(wantMmap);
     expect(mmapSize).toBeGreaterThan(wantMmap - 1024 * 1024);
 
-    // …and the direction of each is itself part of the contract.
-    expect(CONNECTION_MEMORY_DEFAULTS.CACHE_MB).toBeLessThanOrEqual(32);
-    expect(CONNECTION_MEMORY_DEFAULTS.MMAP_MB).toBeGreaterThanOrEqual(1024);
+    // …and what IS part of the contract is that the defaults fit the budget
+    // without being clamped. The governor charges the mmap window like any other
+    // resident memory (it briefly did not, and that made the resident arm of the
+    // budget unable to fire), so a default larger than SQLite's share of the
+    // ceiling would be silently reduced — a default that lies about itself.
+    const asDefaults = { cacheMb: CONNECTION_MEMORY_DEFAULTS.CACHE_MB, mmapMb: CONNECTION_MEMORY_DEFAULTS.MMAP_MB };
+    expect(clampConnectionMemory(asDefaults)).toEqual({ ...asDefaults, clamped: false });
 
     db.close();
   });

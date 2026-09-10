@@ -80,32 +80,54 @@ export interface MemoryReading {
 /** What `check()` decided to do. */
 export type GovernorOutcome =
   | { action: 'ok'; before: MemoryReading }
+  | { action: 'deferred'; before: MemoryReading }
   | { action: 'reclaimed'; before: MemoryReading; after: MemoryReading }
   | { action: 'ceiling'; before: MemoryReading; after: MemoryReading };
 
 const MB = 1024 * 1024;
 
 /**
- * Defaults.
+ * Governed bytes a reclaim must recover to count as worth its cost. Below this it
+ * is treated as futile and the next attempts back off exponentially — see the note
+ * in `check()`. 4 MB is above the read-to-read noise of `process.memoryUsage()`
+ * and far below anything an eviction that actually released a project would free.
+ */
+const FUTILE_RECLAIM_BYTES = 4 * MB;
+
+/** Cap on the exponential backoff, in calls above the high-water mark. */
+const MAX_RECLAIM_DEFERRAL_CALLS = 64;
+
+/**
+ * Defaults: **150 MB steady, 200 MB hard ceiling, per daemon.**
  *
- * Set ABOVE this process's measured floor, deliberately. Measured on two indexes
- * of very different size (iceberg 215k nodes, flink 460k nodes), after evict + a
- * double GC, with SQLite's page cache at 8 MB and mmap off:
+ * These are a requirement, not a tuning preference, so they ship as the defaults
+ * rather than living behind env vars an operator has to discover. The earlier
+ * revision shipped 384/512 and only ever *measured* 100/200 by passing overrides
+ * on the command line — which meant the numbers being reported as met were not
+ * the numbers the product enforced.
+ *
+ * The floor this has to clear. Measured on two indexes of very different size
+ * (iceberg 215k nodes, flink 460k nodes), after evict + a double GC:
  *
  *   committed JS   106–114 MB
- *   rss growth     230–255 MB
+ *   rss growth     230–255 MB   <- with request-time WHEN-label parsing on
  *
- * Both are nearly INDEPENDENT of index size, which is the signal that they are
- * the serving machinery — V8's committed heap and code space, node:sqlite,
- * the FTS5 query path — and not retained graph data. A budget below that floor
- * cannot be met by evicting or collecting, only by restarting, which is a restart
- * loop rather than a budget. So the defaults sit above it and catch genuine
- * growth; a tighter budget is available and honest, but the operator has to ask
- * for it knowing the floor (and `consecutiveCeilings` below stops the loop).
+ * Both are nearly independent of index size, which is the signal that they are
+ * the serving machinery — V8's committed heap and code space, node:sqlite, the
+ * FTS5 query path — and not retained graph data. A budget below the floor cannot
+ * be met by evicting or collecting, only by restarting, which is a restart loop
+ * rather than a budget.
+ *
+ * So 150/200 is reachable only because the floor was brought DOWN to it, in this
+ * order: bounding the cross-project connection cache, counting callers with a SQL
+ * aggregate instead of materializing them, recycling query workers on a call
+ * budget, and moving request-time tree-sitter parsing for WHEN labels off the
+ * serving path. Steady rss growth over those four: 257 -> 181 -> 140 MB.
+ * `MAX_CONSECUTIVE_CEILINGS` below is the backstop if a repo still cannot fit.
  */
 export const MEMORY_BUDGET_DEFAULTS = {
-  HIGH_WATER_MB: 384,
-  CEILING_MB: 512,
+  HIGH_WATER_MB: 150,
+  CEILING_MB: 200,
   /**
    * Ceiling breaches in a row before the governor concludes the budget is below
    * the process floor and stops asking for restarts. Two is enough: one breach
@@ -165,37 +187,34 @@ export function __setRssBaselineForTests(bytes: number | null): void {
   rssBaselineBytes = bytes;
 }
 
-/**
- * Resident bytes from SQLite's memory-mapped window, which the budget must NOT
- * charge for.
+/*
+ * There is NO allowance subtracted from resident growth here, and there must not
+ * be one. An earlier revision subtracted the *configured* `mmap_size` on the
+ * grounds that a clean file-backed mapping is dirty=0 and excluded from the OS's
+ * physical footprint. Both of those facts are true, and the conclusion was still
+ * wrong, because the subtraction was of a number this process CHOOSES:
  *
- * Measured on a 460k-node index with `mmap_size = 1 GB`: `vmmap` reports the
- * `mapped file` region at 1.0 GB of address space with **656 MB resident and
- * 0 KB dirty**, while the process's physical footprint reads 304.6 MB — the OS
- * excludes those pages from what it charges the process entirely, because they
- * are clean, file-backed page cache the kernel can drop at zero cost.
+ *   rssGrowthBytes = max(0, rss - baseline - configuredMmap)
  *
- * `process.memoryUsage().rss` counts them anyway. Governing on raw rss therefore
- * penalised a mapping that costs nothing, and the only way to satisfy the budget
- * was `mmap_size = 0` — which made every query re-read pages through syscalls and
- * cost **30–57% latency** (median 2034 ms at mmap=0 vs 1226 ms at mmap=2048 on the
- * same queries). That is a measurement error paid for in wall-clock.
+ * With the default `mmap_size` at 2 GB that term is zero for any growth short of
+ * 2 GB, so the resident arm of the budget could not fire at all, and
+ * `governedBytes` silently collapsed to the committed JS heap — the one term this
+ * project had already MEASURED to be innocent (the growth is native tree-sitter
+ * parsing, invisible to V8's counters). The budget then reported "0 ceiling
+ * events" by watching the arm that was never the problem while the arm that was
+ * had been switched off. Raising `mmap_size` raised the blind spot with it.
  *
- * So the configured mmap size is subtracted from resident growth. It is an upper
- * bound on what mmap can contribute (resident ≤ mapped), so this can under-count
- * the mapping's share but never over-count it — and the floor at 0 keeps the
- * result honest when growth is smaller than the allowance.
+ * A budget that a config value can widen is not a budget. So the mapping is now
+ * charged like everything else, and it is kept affordable instead of kept
+ * uncounted — see `clampConnectionMemory` in `db/index.ts`, which sizes
+ * cache+mmap against this ceiling so no setting can commit a mapping the budget
+ * could not pay for if every page of it went resident.
+ *
+ * The baseline subtraction that REMAINS is a different thing and is legitimate:
+ * it is captured before the engine opens anything, so it credits only the
+ * bundled runtime's own mapped binary and startup heap — memory that exists
+ * whatever codegraph does, and that no configuration can inflate.
  */
-function mmapAllowanceBytes(): number {
-  try {
-    // Required lazily: db/index.ts pulls in the sqlite layer, and the governor is
-    // constructed on the daemon's startup path where that is not yet wanted.
-    const { resolveConnectionMemory } = require('../db') as typeof import('../db');
-    return Math.max(0, resolveConnectionMemory().mmapMb) * MB;
-  } catch {
-    return 0;
-  }
-}
 
 /** Read the current committed/live/resident numbers. */
 export function readMemory(): MemoryReading {
@@ -203,8 +222,7 @@ export function readMemory(): MemoryReading {
   const m = process.memoryUsage();
   if (rssBaselineBytes === null) rssBaselineBytes = m.rss;
   const committedJsBytes = h.total_heap_size + (h.external_memory ?? 0) + m.arrayBuffers;
-  const rawGrowth = Math.max(0, m.rss - rssBaselineBytes);
-  const rssGrowthBytes = Math.max(0, rawGrowth - mmapAllowanceBytes());
+  const rssGrowthBytes = Math.max(0, m.rss - rssBaselineBytes);
   return {
     governedBytes: Math.max(committedJsBytes, rssGrowthBytes),
     committedJsBytes,
@@ -331,6 +349,12 @@ export class MemoryGovernor {
   private consecutiveCeilings = 0;
   private budgetBelowFloor = false;
   private floorReported = false;
+  /** Tool calls seen while above the high-water mark; the backoff clock. */
+  private callsAboveHighWater = 0;
+  /** Reclaims in a row that recovered nothing; drives the backoff exponent. */
+  private futileReclaims = 0;
+  /** `callsAboveHighWater` value before which no reclaim is attempted. */
+  private deferReclaimUntil = 0;
 
   constructor(
     private readonly hooks: MemoryGovernorHooks,
@@ -374,6 +398,28 @@ export class MemoryGovernor {
       return { action: 'ok', before };
     }
 
+    // Above the high-water mark. Reclaiming is NOT cheap — evict closes the cached
+    // SQLite connections, so the next call reopens and re-warms the project, and
+    // the double GC stops the world twice. That price is worth paying when it buys
+    // memory back, and it is pure latency tax when it does not.
+    //
+    // It often does not, because most of the growth here is native: SQLite's malloc
+    // arenas keep the pages they peaked at, and the tree-sitter WASM heap cannot
+    // shrink at all (`memory.grow` has no inverse). Measured on flink, reclaim
+    // after reclaim moved the governed number by 0 MB — `governed 221MB -> 221MB`,
+    // `167MB -> 167MB` — while still charging both GCs on every single tool call.
+    // With a high-water mark below the process floor that is every call forever,
+    // which measured as 851 ms against 470 ms for the same queries.
+    //
+    // So a run of futile reclaims earns an exponential holiday. The CEILING is
+    // never deferred: the hard gate has to be able to fire on the call that
+    // crosses it, and that is what `atCeiling` protects.
+    const atCeiling = before.governedBytes >= this.budget.ceilingBytes;
+    this.callsAboveHighWater += 1;
+    if (!atCeiling && this.callsAboveHighWater < this.deferReclaimUntil) {
+      return { action: 'deferred', before };
+    }
+
     try {
       this.hooks.evict();
     } catch (err) {
@@ -393,6 +439,15 @@ export class MemoryGovernor {
     }
 
     const after = readMemory();
+    const freedBytes = before.governedBytes - after.governedBytes;
+    if (freedBytes < FUTILE_RECLAIM_BYTES) {
+      this.futileReclaims += 1;
+      this.deferReclaimUntil =
+        this.callsAboveHighWater + Math.min(2 ** this.futileReclaims, MAX_RECLAIM_DEFERRAL_CALLS);
+    } else {
+      this.futileReclaims = 0;
+      this.deferReclaimUntil = 0;
+    }
     this.log(
       `reclaim: governed ${fmtMb(before.governedBytes)} -> ${fmtMb(after.governedBytes)} ` +
       `(js ${fmtMb(before.committedJsBytes)} -> ${fmtMb(after.committedJsBytes)}, ` +
@@ -401,6 +456,7 @@ export class MemoryGovernor {
       `native ${fmtMb(before.nativeBytes)} -> ${fmtMb(after.nativeBytes)}, ` +
       `rss ${fmtMb(after.rssBytes)}), ` +
       `high ${fmtMb(this.budget.highWaterBytes)} ceiling ${fmtMb(this.budget.ceilingBytes)}` +
+      (this.futileReclaims > 0 ? `, futile x${this.futileReclaims} — next attempt in ${this.deferReclaimUntil - this.callsAboveHighWater} calls` : '') +
       (gc ? '' : ' [no gc handle]')
     );
 

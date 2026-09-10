@@ -44,15 +44,25 @@ afterEach(() => {
 });
 
 describe('resolveMemoryBudget', () => {
-  it('defaults sit above this process floor so the defaults never restart-loop', () => {
+  it('defaults to the required budget, which sits AT the process floor by design', () => {
     const b = resolveMemoryBudget({});
     expect(b.enabled).toBe(true);
     expect(b.highWaterBytes).toBe(MEMORY_BUDGET_DEFAULTS.HIGH_WATER_MB * MB);
     expect(b.ceilingBytes).toBe(MEMORY_BUDGET_DEFAULTS.CEILING_MB * MB);
-    // Measured floor after evict + gc is 230–255MB of resident growth on indexes
-    // from 215k to 460k nodes; a default ceiling at or under that would make every
-    // fresh process breach immediately.
-    expect(b.ceilingBytes).toBeGreaterThan(255 * MB);
+    // An earlier revision asserted the opposite — that the ceiling must sit ABOVE
+    // the measured 230–255MB floor, so a fresh process could never breach on its
+    // own. That made the defaults 384/512 while every measurement was taken with
+    // 100/200 passed on the command line, i.e. the enforced budget and the reported
+    // budget were different numbers.
+    //
+    // 150/200 is a requirement, so it ships as the default even though it is close
+    // to the floor. Measured on flink with request-time WHEN-label parsing off:
+    // physical footprint settles at ~190MB with a 200MB peak. What keeps a
+    // near-floor budget from becoming a restart loop is MAX_CONSECUTIVE_CEILINGS —
+    // after two breaches in a row the governor keeps reclaiming but stops asking to
+    // restart, and says so once.
+    expect(b.ceilingBytes).toBeGreaterThanOrEqual(b.highWaterBytes * 1.1);
+    expect(MEMORY_BUDGET_DEFAULTS.MAX_CONSECUTIVE_CEILINGS).toBeGreaterThan(0);
   });
 
   it('honors both overrides', () => {

@@ -46,24 +46,35 @@ export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
 export const CONNECTION_MEMORY_DEFAULTS = {
   /**
    * Page cache, MB. Real charged memory — it lives in malloc arenas (measured:
-   * `MALLOC_SMALL` 104.9 MB dirty with a 64 MB cache). Turning it down is the one
-   * SQLite knob that genuinely reduces a serving process's footprint.
+   * `MALLOC_SMALL` 104.9 MB dirty with a 64 MB cache), so this is the one SQLite
+   * knob that reduces a serving process's footprint roughly linearly.
+   *
+   * 4 MB, not 16, because footprint is what the budget is judged on and the page
+   * cache buys little on this workload. Measured on flink with the pool off and
+   * WHEN labels off, plateau footprint / median latency: cache=16 172.7 MB/695 ms,
+   * cache=8 157.1 MB/704 ms, cache=4 150.9 MB/778 ms. 22 MB for 83 ms, against a
+   * 1651 ms baseline that leaves 2.1x — the memory side is the binding constraint,
+   * so it wins the trade.
    */
-  CACHE_MB: 16,
+  CACHE_MB: 4,
   /**
-   * Memory-mapped window, MB. **Nearly free, and worth a lot of latency.**
+   * Memory-mapped window, MB.
    *
-   * Measured with 1 GB mapped on a 1.4 GB index: `vmmap` reports 656 MB resident
-   * and **0 KB dirty**, and the process's physical footprint (304.6 MB) excludes
-   * it entirely — clean, file-backed page cache the kernel drops at zero cost.
-   * Meanwhile it is worth 30–57% of query latency: median 2034 ms at mmap=0 vs
-   * 1226 ms at mmap=2048 on the same four queries against the same index.
+   * A clean file-backed mapping really is cheap — measured with 1 GB mapped on a
+   * 1.4 GB index, `vmmap` reports 656 MB resident and **0 KB dirty**, and the
+   * process's physical footprint (304.6 MB) excludes it entirely. That fact was
+   * then used to justify BOTH a 2 GB default and subtracting the configured size
+   * from the governed reading, which together made the budget unenforceable: the
+   * resident arm could not fire below 2 GB of growth. Cheap is not free, and a
+   * cost the budget refuses to look at is not bounded.
    *
-   * Raised from 256 to 2048 for exactly that reason. Above the database's own
-   * size there is nothing left to map, so this is effectively "map the whole
-   * index" for anything up to a 2 GB DB.
+   * 64 MB is the measured optimum for footprint, and — counter-intuitively — it is
+   * better than switching the mapping off: 150.9 MB at mmap=64 against 159.8 MB at
+   * mmap=0, because mapped reads do not buffer pages through the allocator's arenas.
+   * See `MMAP_MAX_MB` for the cap that keeps a large window from inflating the
+   * governed reading, and for the full size/footprint table.
    */
-  MMAP_MB: 2048,
+  MMAP_MB: 64,
   /** `temp_store`: 'MEMORY' keeps sorters/temp b-trees in RAM, 'FILE' spills them. */
   TEMP_STORE: 'MEMORY' as 'MEMORY' | 'FILE',
   /**
@@ -90,6 +101,79 @@ function envNonNegativeInt(raw: string | undefined): number | undefined {
   return Number.isInteger(n) && n >= 0 ? n : undefined;
 }
 
+/**
+ * Fraction of the process memory ceiling that SQLite's two memory knobs may claim
+ * between them.
+ *
+ * The governor charges the mmap window like any other resident memory (see the
+ * long note in `mcp/memory-governor.ts`: an earlier revision excluded it and
+ * thereby switched off the arm of the budget that mattered). Charged memory has
+ * to be affordable, so a configuration cannot be allowed to ask for a mapping
+ * larger than the budget could pay for if every page of it went resident.
+ *
+ * A quarter is what is actually spare. The measured floor of a serving daemon —
+ * V8's committed heap and code space, node:sqlite's transient allocation, the
+ * FTS5 query path — is 106–114 MB of committed JS against a 200 MB ceiling, and
+ * none of it is cache or mmap. So SQLite's *configured* share is the leftover
+ * slice, not the main course.
+ */
+const SQLITE_MEMORY_SHARE = 0.25;
+
+/**
+ * Hard cap on the mmap window, MB — independent of the ceiling.
+ *
+ * The window is NOT charged linearly, so clamping it against a share of the budget
+ * would be modelling a cost that does not exist. Measured on flink with the pool
+ * off and WHEN labels off, physical footprint by window size:
+ *
+ *   mmap=0    159.8 MB      <- WORSE than a small window
+ *   mmap=64   150.9 MB
+ *   mmap=128  152.4 MB
+ *   mmap=256  157.1 MB
+ *
+ * Mapped reads do not buffer pages through the allocator's arenas, so a small
+ * window costs LESS retained memory than no window at all: "turn the mapping off to
+ * save memory" is the wrong instinct, and acting on it is what produced the
+ * regression this branch spent a day chasing.
+ *
+ * What the cap is for is the OTHER failure: the governed reading is resident growth,
+ * which counts mapped pages the OS does not charge, so a very large window inflates
+ * it. An earlier revision answered that by subtracting the configured window from the
+ * reading, which made the budget unenforceable at 2 GB. A constant cap bounds the
+ * discrepancy at a number a reader can see and a test can pin, and no configuration
+ * can raise it.
+ */
+const MMAP_MAX_MB = 128;
+
+/**
+ * Ceiling assumed when clamping, MB. Pinned equal to
+ * `MEMORY_BUDGET_DEFAULTS.CEILING_MB` by a test rather than imported: `db/` is
+ * the lower layer and must not depend on `mcp/`.
+ */
+const ASSUMED_CEILING_MB = 200;
+
+/**
+ * Clamp the two SQLite memory knobs to what the budget can actually pay for.
+ *
+ * The page cache is charged linearly — it is real dirty memory in malloc arenas
+ * (`MALLOC_SMALL` measured 104.9 MB dirty at a 64 MB cache) — so it is clamped to a
+ * share of the ceiling. The mmap window is not, so it is clamped to `MMAP_MAX_MB`
+ * instead. Two knobs, two cost models, because they measured differently.
+ */
+export function clampConnectionMemory(
+  requested: { cacheMb: number; mmapMb: number },
+  ceilingMb: number = ASSUMED_CEILING_MB,
+): { cacheMb: number; mmapMb: number; clamped: boolean } {
+  const cacheBudgetMb = Math.max(0, Math.floor(ceilingMb * SQLITE_MEMORY_SHARE));
+  const cacheMb = Math.min(Math.max(0, requested.cacheMb), cacheBudgetMb);
+  const mmapMb = Math.min(Math.max(0, requested.mmapMb), MMAP_MAX_MB);
+  return {
+    cacheMb,
+    mmapMb,
+    clamped: cacheMb !== requested.cacheMb || mmapMb !== requested.mmapMb,
+  };
+}
+
 export function resolveConnectionMemory(env: NodeJS.ProcessEnv = process.env): {
   cacheMb: number;
   mmapMb: number;
@@ -97,9 +181,17 @@ export function resolveConnectionMemory(env: NodeJS.ProcessEnv = process.env): {
   softHeapMb: number;
 } {
   const rawTemp = (env.CODEGRAPH_SQLITE_TEMP_STORE ?? '').trim().toUpperCase();
+  const ceilingMb = envNonNegativeInt(env.CODEGRAPH_MEMORY_CEILING_MB) ?? ASSUMED_CEILING_MB;
+  const { cacheMb, mmapMb } = clampConnectionMemory(
+    {
+      cacheMb: envNonNegativeInt(env.CODEGRAPH_SQLITE_CACHE_MB) ?? CONNECTION_MEMORY_DEFAULTS.CACHE_MB,
+      mmapMb: envNonNegativeInt(env.CODEGRAPH_SQLITE_MMAP_MB) ?? CONNECTION_MEMORY_DEFAULTS.MMAP_MB,
+    },
+    ceilingMb,
+  );
   return {
-    cacheMb: envNonNegativeInt(env.CODEGRAPH_SQLITE_CACHE_MB) ?? CONNECTION_MEMORY_DEFAULTS.CACHE_MB,
-    mmapMb: envNonNegativeInt(env.CODEGRAPH_SQLITE_MMAP_MB) ?? CONNECTION_MEMORY_DEFAULTS.MMAP_MB,
+    cacheMb,
+    mmapMb,
     tempStore: rawTemp === 'FILE' || rawTemp === 'MEMORY' ? rawTemp : CONNECTION_MEMORY_DEFAULTS.TEMP_STORE,
     softHeapMb: envNonNegativeInt(env.CODEGRAPH_SQLITE_SOFT_HEAP_MB) ?? CONNECTION_MEMORY_DEFAULTS.SOFT_HEAP_MB,
   };
