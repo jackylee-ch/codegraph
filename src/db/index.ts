@@ -46,6 +46,24 @@ export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
 export const CONNECTION_MEMORY_DEFAULTS = {
   CACHE_MB: 64,
   MMAP_MB: 256,
+  /** `temp_store`: 'MEMORY' keeps sorters/temp b-trees in RAM, 'FILE' spills them. */
+  TEMP_STORE: 'MEMORY' as 'MEMORY' | 'FILE',
+  /**
+   * `soft_heap_limit`, MB. 0 = unlimited (SQLite's default).
+   *
+   * This is the knob for the term that dominates a serving process's resident
+   * growth. Measured on a 460k-node index: one explore raises rss ~100 MB above a
+   * warm baseline and it never comes back, while V8's own counters stay flat
+   * (heapUsed returns to 18 MB, code space 1 MB, V8-malloc peak 15 MB) and the
+   * growth survives `db.close()`. That is SQLite's transient allocation — FTS5
+   * ranking, sorters, statement scratch — passing through the system allocator,
+   * which grows its arenas to the peak and does not return the pages.
+   *
+   * The peak is what gets retained, so bounding SQLite's heap bounds the arena.
+   * A soft limit makes SQLite recycle its own cache to stay under rather than
+   * failing, so it costs I/O, not correctness.
+   */
+  SOFT_HEAP_MB: 0,
 } as const;
 
 function envNonNegativeInt(raw: string | undefined): number | undefined {
@@ -57,22 +75,31 @@ function envNonNegativeInt(raw: string | undefined): number | undefined {
 export function resolveConnectionMemory(env: NodeJS.ProcessEnv = process.env): {
   cacheMb: number;
   mmapMb: number;
+  tempStore: 'MEMORY' | 'FILE';
+  softHeapMb: number;
 } {
+  const rawTemp = (env.CODEGRAPH_SQLITE_TEMP_STORE ?? '').trim().toUpperCase();
   return {
     cacheMb: envNonNegativeInt(env.CODEGRAPH_SQLITE_CACHE_MB) ?? CONNECTION_MEMORY_DEFAULTS.CACHE_MB,
     mmapMb: envNonNegativeInt(env.CODEGRAPH_SQLITE_MMAP_MB) ?? CONNECTION_MEMORY_DEFAULTS.MMAP_MB,
+    tempStore: rawTemp === 'FILE' || rawTemp === 'MEMORY' ? rawTemp : CONNECTION_MEMORY_DEFAULTS.TEMP_STORE,
+    softHeapMb: envNonNegativeInt(env.CODEGRAPH_SQLITE_SOFT_HEAP_MB) ?? CONNECTION_MEMORY_DEFAULTS.SOFT_HEAP_MB,
   };
 }
 
 function configureConnection(db: SqliteDatabase): void {
-  const { cacheMb, mmapMb } = resolveConnectionMemory();
+  const { cacheMb, mmapMb, tempStore, softHeapMb } = resolveConnectionMemory();
   db.pragma('busy_timeout = 5000');      // MUST be first — see above
   db.pragma('foreign_keys = ON');
   db.pragma('journal_mode = WAL');       // node:sqlite supports WAL on every platform
   db.pragma('synchronous = NORMAL');     // safe with WAL mode
   db.pragma(`cache_size = -${cacheMb * 1000}`);   // page cache, MB (negative = KiB)
-  db.pragma('temp_store = MEMORY');      // temp tables in memory
+  db.pragma(`temp_store = ${tempStore}`);         // temp b-trees in RAM or on disk
   db.pragma(`mmap_size = ${mmapMb * 1024 * 1024}`); // memory-mapped I/O, MB (0 = off)
+  // Bounds SQLite's own malloc so its transient peak cannot grow the system
+  // allocator's arenas past the process budget. Soft: SQLite recycles its cache
+  // to stay under rather than failing a query.
+  if (softHeapMb > 0) db.pragma(`soft_heap_limit = ${softHeapMb * 1024 * 1024}`);
   // Without a journal_size_limit the -wal file never shrinks below its
   // high-water mark while a connection lives: checkpoints fold frames back but
   // leave the file at full size, so one giant deferred-sync WAL stays giant
