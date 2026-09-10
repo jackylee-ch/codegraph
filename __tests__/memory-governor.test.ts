@@ -20,7 +20,9 @@ import {
   getGcHandle,
   resolveMemoryBudget,
   MEMORY_BUDGET_DEFAULTS,
+  captureRssBaseline,
   __resetGcHandleForTests,
+  __setRssBaselineForTests,
   type MemoryBudget,
   type MemoryReading,
 } from '../src/mcp/memory-governor';
@@ -41,11 +43,15 @@ afterEach(() => {
 });
 
 describe('resolveMemoryBudget', () => {
-  it('defaults to the documented budget and is enabled', () => {
+  it('defaults sit above this process floor so the defaults never restart-loop', () => {
     const b = resolveMemoryBudget({});
     expect(b.enabled).toBe(true);
     expect(b.highWaterBytes).toBe(MEMORY_BUDGET_DEFAULTS.HIGH_WATER_MB * MB);
     expect(b.ceilingBytes).toBe(MEMORY_BUDGET_DEFAULTS.CEILING_MB * MB);
+    // Measured floor after evict + gc is 230–255MB of resident growth on indexes
+    // from 215k to 460k nodes; a default ceiling at or under that would make every
+    // fresh process breach immediately.
+    expect(b.ceilingBytes).toBeGreaterThan(255 * MB);
   });
 
   it('honors both overrides', () => {
@@ -83,18 +89,37 @@ describe('resolveMemoryBudget', () => {
 describe('readMemory', () => {
   it('reports committed, live and resident bytes', () => {
     const r = readMemory();
-    expect(r.governedBytes).toBeGreaterThan(0);
+    expect(r.committedJsBytes).toBeGreaterThan(0);
     expect(r.liveBytes).toBeGreaterThan(0);
     expect(r.rssBytes).toBeGreaterThan(0);
     // Committed must cover live — the difference is what a GC could hand back.
-    expect(r.governedBytes).toBeGreaterThanOrEqual(r.liveBytes);
+    expect(r.committedJsBytes).toBeGreaterThanOrEqual(r.liveBytes);
   });
 
-  it('governs on committed bytes, NOT on rss', () => {
-    // rss includes the runtime's mapped, clean, shared binary; governing on it
-    // would trip any sane threshold on the first read.
+  it('governs on the WORSE of committed JS and resident growth', () => {
+    // Neither term alone can be gamed: JS-only is blind to SQLite's page cache
+    // and mmap, absolute rss is dominated by the runtime's clean mapped binary.
     const r = readMemory();
-    expect(r.governedBytes).not.toBe(r.rssBytes);
+    expect(r.governedBytes).toBe(Math.max(r.committedJsBytes, r.rssGrowthBytes));
+  });
+
+  it('resident growth is a DELTA over baseline, never the absolute rss', () => {
+    __setRssBaselineForTests(null);
+    const base = captureRssBaseline();
+    expect(base).toBeGreaterThan(0);
+    const r = readMemory();
+    expect(r.rssGrowthBytes).toBeLessThan(r.rssBytes);
+    // An absolute-rss budget would be unsatisfiable: the runtime's own footprint
+    // already exceeds any sane per-project number before codegraph does anything.
+    expect(r.rssBytes).toBeGreaterThan(r.rssGrowthBytes);
+  });
+
+  it('a rise in rss above baseline shows up in the governed number', () => {
+    __setRssBaselineForTests(1); // pretend the process started at ~nothing
+    const r = readMemory();
+    expect(r.rssGrowthBytes).toBeGreaterThan(r.committedJsBytes);
+    expect(r.governedBytes).toBe(r.rssGrowthBytes);
+    __setRssBaselineForTests(null);
   });
 });
 
@@ -168,6 +193,26 @@ describe('MemoryGovernor.check', () => {
     expect(g.check().action).toBe('ceiling');
     expect(seen).toHaveLength(1); // second trip must not re-fire
     expect(seen[0]!.governedBytes).toBeGreaterThan(0);
+  });
+
+  it('stops asking for restarts once the budget is provably below the floor', () => {
+    // A ceiling no fresh process can meet is a restart loop, not a budget. After
+    // MAX_CONSECUTIVE_CEILINGS the governor says so and stops self-destructing —
+    // it does NOT quietly widen the budget, which would be the tool overriding
+    // the operator.
+    const lines: string[] = [];
+    let restarts = 0;
+    const g = new MemoryGovernor(
+      { evict: () => {}, onCeiling: () => { restarts++; }, log: (l) => lines.push(l) },
+      budget({ highWaterBytes: 1, ceilingBytes: 1 })
+    );
+    for (let i = 0; i < MEMORY_BUDGET_DEFAULTS.MAX_CONSECUTIVE_CEILINGS + 3; i++) {
+      expect(g.check().action).toBe('ceiling');
+    }
+    expect(restarts).toBe(1);
+    expect(lines.filter((l) => l.startsWith('budget below floor'))).toHaveLength(1);
+    // Reclaim keeps running — only the self-destruct stops.
+    expect(lines.filter((l) => l.startsWith('reclaim:')).length).toBeGreaterThan(1);
   });
 
   it('a throwing evict hook never fails the caller', () => {

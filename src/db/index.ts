@@ -27,14 +27,52 @@ export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
  * on a writer, so this timeout only governs cross-process write contention
  * (e.g. the git-hook `codegraph sync` running while the MCP server writes).
  */
+/**
+ * Per-connection memory pragmas, resolved from the environment.
+ *
+ * These two are the largest non-JS terms in a serving process, and both were
+ * hardcoded. Measured on a 1.4 GB index: the page cache is real charged memory,
+ * while the mmap window is 256 MB of address space whose pages read as CLEAN
+ * (`vmmap` reports dirty=0), so it costs little in physical footprint but does
+ * inflate rss — which matters when the budget is expressed in rss.
+ *
+ * Every connection pays these independently: the main one, the store writer, each
+ * resolver worker, and each query-pool worker. A daemon meant to hold a small
+ * budget needs to be able to turn them down.
+ *
+ * `cache_size` is negative-as-kibibytes in SQLite (`-64000` = 64 MB), which the
+ * env override hides behind plain megabytes. `mmap_size = 0` disables mmap.
+ */
+export const CONNECTION_MEMORY_DEFAULTS = {
+  CACHE_MB: 64,
+  MMAP_MB: 256,
+} as const;
+
+function envNonNegativeInt(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : undefined;
+}
+
+export function resolveConnectionMemory(env: NodeJS.ProcessEnv = process.env): {
+  cacheMb: number;
+  mmapMb: number;
+} {
+  return {
+    cacheMb: envNonNegativeInt(env.CODEGRAPH_SQLITE_CACHE_MB) ?? CONNECTION_MEMORY_DEFAULTS.CACHE_MB,
+    mmapMb: envNonNegativeInt(env.CODEGRAPH_SQLITE_MMAP_MB) ?? CONNECTION_MEMORY_DEFAULTS.MMAP_MB,
+  };
+}
+
 function configureConnection(db: SqliteDatabase): void {
+  const { cacheMb, mmapMb } = resolveConnectionMemory();
   db.pragma('busy_timeout = 5000');      // MUST be first — see above
   db.pragma('foreign_keys = ON');
   db.pragma('journal_mode = WAL');       // node:sqlite supports WAL on every platform
   db.pragma('synchronous = NORMAL');     // safe with WAL mode
-  db.pragma('cache_size = -64000');      // 64 MB page cache
+  db.pragma(`cache_size = -${cacheMb * 1000}`);   // page cache, MB (negative = KiB)
   db.pragma('temp_store = MEMORY');      // temp tables in memory
-  db.pragma('mmap_size = 268435456');    // 256 MB memory-mapped I/O
+  db.pragma(`mmap_size = ${mmapMb * 1024 * 1024}`); // memory-mapped I/O, MB (0 = off)
   // Without a journal_size_limit the -wal file never shrinks below its
   // high-water mark while a connection lives: checkpoints fold frames back but
   // leave the file at full size, so one giant deferred-sync WAL stays giant
