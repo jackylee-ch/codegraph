@@ -60,6 +60,38 @@ const MAX_POOL_SIZE = 16;
 const CRASH_BUDGET = 12;
 
 /**
+ * Calls a worker serves before it is retired and replaced.
+ *
+ * This is the serving-side counterpart to the indexer's parse-worker recycle
+ * (extraction/index.ts recycles every 250 parses). Both exist for the same
+ * reason: **WebAssembly memory is monotonic.** `memory.grow` has no inverse, so a
+ * thread that has parsed source carries that high-water for as long as it lives —
+ * measured on a 460k-node index, one explore brings the tree-sitter runtime up,
+ * loads eight grammars and parses source for the WHEN labels, and rss goes
+ * 220 MB → 320 MB. The second explore adds 1 MB: it is a high-water, not a leak.
+ * Nothing in-process returns it — `resetParser`, `clearParserCache` and a full GC
+ * were all measured at 87 MB before and after.
+ *
+ * Terminating the thread DOES return it, because the whole isolate goes away. So
+ * the only way a long-lived server keeps a bounded footprint while still parsing
+ * at request time is to do that parsing in a thread it is willing to replace.
+ *
+ * 100 rather than the indexer's 250: a query worker's calls are far heavier than
+ * a single file parse (each explore parses several files), and a serving process
+ * is judged on steady footprint where the indexer is judged on throughput. Set
+ * `CODEGRAPH_QUERY_WORKER_MAX_CALLS=0` to disable recycling.
+ */
+const DEFAULT_WORKER_MAX_CALLS = 100;
+
+/** Resolve the per-worker call budget; 0 (or a malformed value) disables recycling. */
+export function resolveWorkerMaxCalls(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_WORKER_MAX_CALLS;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0) return DEFAULT_WORKER_MAX_CALLS;
+  return n;
+}
+
+/**
  * Max workers cold-starting at once. A worker's cold start is heavy — full
  * module load (tree-sitter etc.) + opening a large WAL DB — and starting the
  * whole pool simultaneously thrashes CPU/I-O so badly it can stall the daemon's
@@ -97,6 +129,12 @@ export interface QueryPoolOptions {
   softTimeoutMs?: number;
   /** Retries for an in-flight call whose worker crashed. Default 1. */
   maxRetries?: number;
+  /**
+   * Calls a worker serves before it is retired and replaced. Default 100
+   * (`CODEGRAPH_QUERY_WORKER_MAX_CALLS`); 0 disables recycling.
+   * See DEFAULT_WORKER_MAX_CALLS for why this exists.
+   */
+  workerMaxCalls?: number;
   /** Worker factory (tests inject a fake). Defaults to a real `worker_threads` Worker. */
   createWorker?: () => PoolWorker;
 }
@@ -153,6 +191,9 @@ export class QueryPool {
   private nextId = 1;
   private totalCrashes = 0;
   private destroyed = false;
+  /** Calls each live worker has served, for the recycle budget. */
+  private callsServed = new Map<PoolWorker, number>();
+  private readonly workerMaxCalls: number;
   private readonly root: string;
   private readonly maxSize: number;
   private readonly softTimeoutMs: number;
@@ -164,6 +205,7 @@ export class QueryPool {
     this.maxSize = Math.max(1, Math.min(opts.size ?? Math.max(1, os.cpus().length - 1), MAX_POOL_SIZE));
     this.softTimeoutMs = opts.softTimeoutMs ?? resolveBusyTimeoutMs();
     this.maxRetries = opts.maxRetries ?? 1;
+    this.workerMaxCalls = opts.workerMaxCalls ?? resolveWorkerMaxCalls(process.env.CODEGRAPH_QUERY_WORKER_MAX_CALLS);
     this.createWorker = opts.createWorker ?? (() => new Worker(WORKER_FILE, { workerData: { root: this.root } }));
     this.spawnOne(); // one eager warm worker, ready for the first call
   }
@@ -229,10 +271,50 @@ export class QueryPool {
     if (m.type === 'result') {
       const job = this.inflight.get(w);
       this.inflight.delete(w);
-      this.idle.push(w);
+      const retiring = this.shouldRetire(w);
+      if (!retiring) this.idle.push(w);
       if (job) this.settle(job, m.result ?? busyGuidance(0));
+      // Settle the caller BEFORE tearing the thread down: retirement is
+      // bookkeeping and must never delay the answer that triggered it.
+      if (retiring) this.retire(w);
       this.drain();
     }
+  }
+
+  /**
+   * Has this worker served its call budget?
+   *
+   * Counted here rather than at dispatch so a worker is only ever retired between
+   * calls, never mid-flight.
+   */
+  private shouldRetire(w: PoolWorker): boolean {
+    if (this.destroyed || this.workerMaxCalls === 0) return false;
+    const served = (this.callsServed.get(w) ?? 0) + 1;
+    this.callsServed.set(w, served);
+    return served >= this.workerMaxCalls;
+  }
+
+  /**
+   * Replace a worker that has served its budget, to give back the WASM heap it
+   * grew (see DEFAULT_WORKER_MAX_CALLS).
+   *
+   * Order matters: spawn the replacement first so a burst still has somewhere to
+   * go, and do NOT count this as a crash — it is planned, and charging the crash
+   * budget would eventually trip the circuit breaker and push every call back
+   * in-process, which is the opposite of the intent. `onWorkerGone` is skipped
+   * by removing the worker from `workers` before terminating it: its `exit`
+   * handler then sees an unknown worker and returns.
+   */
+  private retire(w: PoolWorker): void {
+    if (!this.workers.has(w)) return;
+    this.workers.delete(w);
+    this.pendingWorkers.delete(w);
+    this.callsServed.delete(w);
+    this.idle = this.idle.filter((x) => x !== w);
+    if (!this.destroyed && this.workers.size + this.pendingWorkers.size < this.maxSize) {
+      this.spawnOne();
+    }
+    try { void w.terminate(); } catch { /* already gone */ }
   }
 
   // A worker died (crash hook, OOM, segfault, exit≠0). Respawn a replacement and
