@@ -72,8 +72,42 @@ const MAX_TEXT = 80;
 
 const JS_FAMILY: ReadonlySet<Language> = new Set(['typescript', 'javascript', 'tsx', 'jsx']);
 
+/**
+ * Whether request-time source parsing is allowed in this process.
+ *
+ * Branch guards are the ONLY thing that parses source while serving a query: they
+ * read the caller's file with tree-sitter to say what condition an arrow runs
+ * under. That is also the single largest term in a long-lived server's resident
+ * memory, and it is irreducible once paid.
+ *
+ * Measured on a 460k-node index: one explore brings the tree-sitter runtime up,
+ * loads eight grammars and parses source, taking rss from 220 MB to 320 MB. The
+ * second explore adds 1 MB — a high-water, not a leak. And WebAssembly memory is
+ * monotonic (`memory.grow` has no inverse): `resetParser`, `clearParserCache` and
+ * a full GC were each measured at 87 MB before and after, and recycling the query
+ * worker thread does not help either (168–177 MB steady whether the worker is
+ * retired every call, every second call, or never) because a terminated thread's
+ * pages stay with the process.
+ *
+ * So a server that parses cannot hold a budget below that high-water, and the
+ * only lever left is not to parse. Setting `CODEGRAPH_NO_WHEN_LABELS=1` trades the
+ * `WHEN` condition labels for roughly 100 MB of steady footprint. Losing them is
+ * already a supported state rather than a broken one — a language with no walk
+ * rules yields no label, never a wrong one, which is the existing design.
+ *
+ * Read once: an operator does not change this mid-process, and the check sits on
+ * the per-edge path.
+ */
+const REQUEST_PARSE_DISABLED = process.env.CODEGRAPH_NO_WHEN_LABELS === '1';
+
+/** Whether this process will parse source at request time at all. */
+export function requestTimeParsingEnabled(): boolean {
+  return !REQUEST_PARSE_DISABLED;
+}
+
 /** Languages with walk rules below. Others yield no guards (never a wrong one). */
 export function supportsBranchGuards(language: Language | string | undefined | null): boolean {
+  if (REQUEST_PARSE_DISABLED) return false;
   return !!language && RULES_BY_LANGUAGE.has(language as Language);
 }
 
@@ -921,6 +955,7 @@ function firstNonBlankColumn(source: string, row: number): number {
 
 /** Load the grammars {@link guardsForFileSync} needs; a no-op once loaded, never throws. */
 export async function warmBranchGuardGrammars(only?: readonly Language[]): Promise<void> {
+  if (REQUEST_PARSE_DISABLED) return;
   const wanted = BRANCH_GUARD_LANGUAGES.filter((l) => !only || only.includes(l));
   if (wanted.length === 0) return;
   try {
