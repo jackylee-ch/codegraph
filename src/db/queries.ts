@@ -278,6 +278,44 @@ export class QueryBuilder {
   private segmentedNames: Set<string> = new Set();
   private static readonly MAX_SEGMENTED_NAMES = 65536;
 
+  /**
+   * Whole-graph aggregates memoized for the life of one graph generation.
+   *
+   * `getDominantFile()` and `getTopRouteFile()` are properties of the ENTIRE
+   * index — "which file holds the densest concentration of in-file edges / route
+   * nodes". They cannot change between two reads unless the index changed, yet
+   * both ran on every `codegraph_explore` call, and the dominant-file query is a
+   * full scan of `edges` with two joins back to `nodes`.
+   *
+   * Measured on a 460k-node / 1.37M-edge index with a CPU profile of the explore
+   * path: `getDominantFile` was **65% of all CPU time** (13.5s + 0.9s of a 22.2s
+   * profile), with `findNodesByNameSubstring` at 10% and `searchNodesFTS` at 7%.
+   * One unchanging aggregate was two thirds of query latency.
+   *
+   * Invalidated by `bumpGraphGeneration()`, which every write path calls. Keyed on
+   * the counter rather than a timestamp so an invalidation can never be missed by
+   * clock granularity, and stored as `{ gen, value }` so a `null` result (no
+   * dominant file) is cached as firmly as a hit — recomputing "still nothing" on
+   * every call would leave the worst case unfixed.
+   */
+  private graphGeneration = 0;
+  private dominantFileMemo: { gen: number; value: { filePath: string; edgeCount: number; nextEdgeCount: number } | null } | null = null;
+  private topRouteFileMemo: { gen: number; value: { filePath: string; routeCount: number; totalRoutes: number } | null } | null = null;
+
+  /**
+   * Invalidate whole-graph aggregate memos. Called by every write path — nodes,
+   * edges, files and unresolved refs alike, because the dominant file is derived
+   * from nodes AND edges and a file deletion removes both.
+   */
+  private bumpGraphGeneration(): void {
+    this.graphGeneration += 1;
+  }
+
+  /** Current graph generation. Exposed for tests that assert invalidation. */
+  getGraphGeneration(): number {
+    return this.graphGeneration;
+  }
+
   // Multi-row INSERT statements, cached per (statement kind × row count). The
   // bulk write path decomposes N rows into a few fixed batch sizes so each
   // size's statement is prepared once and reused — one .run() binds a whole
@@ -374,6 +412,7 @@ export class QueryBuilder {
    * Insert a new node
    */
   insertNode(node: Node): void {
+    this.bumpGraphGeneration();
     if (!this.stmts.insertNode) {
       this.stmts.insertNode = this.db.prepare(`
         INSERT OR REPLACE INTO nodes (
@@ -471,6 +510,7 @@ export class QueryBuilder {
    * Insert multiple nodes in a transaction
    */
   insertNodes(nodes: Node[]): void {
+    this.bumpGraphGeneration();
     this.db.transaction(() => {
       // Bulk path: same semantics as insertNode() per row (validation, cache
       // invalidation, segment vocab), but bound as multi-row INSERTs — the
@@ -594,6 +634,7 @@ export class QueryBuilder {
    * Update an existing node
    */
   updateNode(node: Node): void {
+    this.bumpGraphGeneration();
     if (!this.stmts.updateNode) {
       this.stmts.updateNode = this.db.prepare(`
         UPDATE nodes SET
@@ -669,6 +710,7 @@ export class QueryBuilder {
    * Delete a node by ID
    */
   deleteNode(id: string): void {
+    this.bumpGraphGeneration();
     if (!this.stmts.deleteNode) {
       this.stmts.deleteNode = this.db.prepare('DELETE FROM nodes WHERE id = ?');
     }
@@ -681,6 +723,7 @@ export class QueryBuilder {
    * Delete all nodes for a file
    */
   deleteNodesByFile(filePath: string): void {
+    this.bumpGraphGeneration();
     if (!this.stmts.deleteNodesByFile) {
       this.stmts.deleteNodesByFile = this.db.prepare('DELETE FROM nodes WHERE file_path = ?');
     }
@@ -948,6 +991,12 @@ export class QueryBuilder {
    * boosting a test file's directory would be a misfire.
    */
   getDominantFile(): { filePath: string; edgeCount: number; nextEdgeCount: number } | null {
+    // Whole-graph aggregate — see dominantFileMemo. Before this memo, the scan
+    // below was 65% of explore's CPU time on a 1.37M-edge index, recomputed on
+    // every call for an answer that only a write can change.
+    if (this.dominantFileMemo && this.dominantFileMemo.gen === this.graphGeneration) {
+      return this.dominantFileMemo.value;
+    }
     if (!this.stmts.getDominantFile) {
       // Pull top 20 candidates; we then filter out test/generated files
       // in code (regex-grade matching that SQL LIKE can't express). The
@@ -970,12 +1019,15 @@ export class QueryBuilder {
     const rows = this.stmts.getDominantFile.all() as Array<{ file_path: string; edge_count: number }>;
     const generated = this.getGeneratedPathsAmong(rows.map(r => r.file_path));
     const filtered = rows.filter(r => !isLowValueFile(r.file_path, generated));
-    if (filtered.length === 0 || filtered[0]!.edge_count < 20) return null;
-    return {
-      filePath: filtered[0]!.file_path,
-      edgeCount: filtered[0]!.edge_count,
-      nextEdgeCount: filtered[1]?.edge_count ?? 0,
-    };
+    const value = (filtered.length === 0 || filtered[0]!.edge_count < 20)
+      ? null
+      : {
+          filePath: filtered[0]!.file_path,
+          edgeCount: filtered[0]!.edge_count,
+          nextEdgeCount: filtered[1]?.edge_count ?? 0,
+        };
+    this.dominantFileMemo = { gen: this.graphGeneration, value };
+    return value;
   }
 
   /**
@@ -991,6 +1043,11 @@ export class QueryBuilder {
    * 30% of them (diffuse routing → no single answer file).
    */
   getTopRouteFile(): { filePath: string; routeCount: number; totalRoutes: number } | null {
+    // Same shape as getDominantFile: a whole-graph aggregate that only a write
+    // can change, previously recomputed on every explore.
+    if (this.topRouteFileMemo && this.topRouteFileMemo.gen === this.graphGeneration) {
+      return this.topRouteFileMemo.value;
+    }
     if (!this.stmts.getTopRouteFile) {
       this.stmts.getTopRouteFile = this.db.prepare(`
         SELECT file_path, COUNT(*) AS cnt
@@ -1004,12 +1061,16 @@ export class QueryBuilder {
     const rows = this.stmts.getTopRouteFile.all() as Array<{ file_path: string; cnt: number }>;
     const generated = this.getGeneratedPathsAmong(rows.map(r => r.file_path));
     const filtered = rows.filter(r => !isLowValueFile(r.file_path, generated));
-    if (filtered.length === 0) return null;
-    const totalRoutes = filtered.reduce((sum, r) => sum + r.cnt, 0);
-    const top = filtered[0]!;
-    if (totalRoutes < 3 || top.cnt < 3) return null;
-    if (top.cnt / totalRoutes < 0.30) return null;
-    return { filePath: top.file_path, routeCount: top.cnt, totalRoutes };
+    const value = ((): { filePath: string; routeCount: number; totalRoutes: number } | null => {
+      if (filtered.length === 0) return null;
+      const totalRoutes = filtered.reduce((sum, r) => sum + r.cnt, 0);
+      const top = filtered[0]!;
+      if (totalRoutes < 3 || top.cnt < 3) return null;
+      if (top.cnt / totalRoutes < 0.30) return null;
+      return { filePath: top.file_path, routeCount: top.cnt, totalRoutes };
+    })();
+    this.topRouteFileMemo = { gen: this.graphGeneration, value };
+    return value;
   }
 
   /**
@@ -1769,6 +1830,7 @@ export class QueryBuilder {
    * Insert a new edge
    */
   insertEdge(edge: Edge): void {
+    this.bumpGraphGeneration();
     if (!this.stmts.insertEdge) {
       this.stmts.insertEdge = this.db.prepare(`
         INSERT OR IGNORE INTO edges (source, target, kind, metadata, line, col, provenance)
@@ -1791,6 +1853,7 @@ export class QueryBuilder {
    * Insert multiple edges in a transaction
    */
   insertEdges(edges: Edge[]): void {
+    this.bumpGraphGeneration();
     if (edges.length === 0) return;
 
     this.db.transaction(() => {
@@ -1829,6 +1892,7 @@ export class QueryBuilder {
    * Delete all edges from a source node
    */
   deleteEdgesBySource(sourceId: string): void {
+    this.bumpGraphGeneration();
     if (!this.stmts.deleteEdgesBySource) {
       this.stmts.deleteEdgesBySource = this.db.prepare('DELETE FROM edges WHERE source = ?');
     }
@@ -2671,6 +2735,7 @@ export class QueryBuilder {
    * Insert or update a file record
    */
   upsertFile(file: FileRecord): void {
+    this.bumpGraphGeneration();
     if (!this.stmts.upsertFile) {
       this.stmts.upsertFile = this.db.prepare(`
         INSERT INTO files (path, content_hash, language, size, modified_at, indexed_at, node_count, errors, generated)
@@ -2848,6 +2913,7 @@ export class QueryBuilder {
    * Delete a file record and its nodes
    */
   deleteFile(filePath: string): void {
+    this.bumpGraphGeneration();
     this.db.transaction(() => {
       this.deleteNodesByFile(filePath);
       if (!this.stmts.deleteFile) {
@@ -2945,6 +3011,7 @@ export class QueryBuilder {
    * Insert an unresolved reference
    */
   insertUnresolvedRef(ref: UnresolvedReference): void {
+    this.bumpGraphGeneration();
     if (!this.stmts.insertUnresolved) {
       this.stmts.insertUnresolved = this.db.prepare(`
         INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language)
@@ -2968,6 +3035,7 @@ export class QueryBuilder {
    * Insert multiple unresolved references in a transaction
    */
   insertUnresolvedRefsBatch(refs: UnresolvedReference[]): void {
+    this.bumpGraphGeneration();
     if (refs.length === 0) return;
     const insert = this.db.transaction(() => {
       const rows: unknown[][] = [];
@@ -2997,6 +3065,7 @@ export class QueryBuilder {
    * Delete unresolved references from a node
    */
   deleteUnresolvedByNode(nodeId: string): void {
+    this.bumpGraphGeneration();
     if (!this.stmts.deleteUnresolvedByNode) {
       this.stmts.deleteUnresolvedByNode = this.db.prepare(
         'DELETE FROM unresolved_refs WHERE from_node_id = ?'
@@ -3200,6 +3269,7 @@ export class QueryBuilder {
    * Delete all unresolved references (after resolution)
    */
   clearUnresolvedReferences(): void {
+    this.bumpGraphGeneration();
     this.db.exec('DELETE FROM unresolved_refs');
   }
 
@@ -3207,6 +3277,7 @@ export class QueryBuilder {
    * Delete resolved references by their IDs
    */
   deleteResolvedReferences(fromNodeIds: string[]): void {
+    this.bumpGraphGeneration();
     if (fromNodeIds.length === 0) return;
     // Chunk under SQLite's parameter limit, matching every other IN-list in
     // this file. The internal resolution path uses deleteSpecificResolvedReferences
@@ -3225,6 +3296,7 @@ export class QueryBuilder {
    * More precise than deleteResolvedReferences — only removes refs that were actually resolved.
    */
   deleteSpecificResolvedReferences(refs: Array<{ fromNodeId: string; referenceName: string; referenceKind: string }>): number {
+    this.bumpGraphGeneration();
     if (refs.length === 0) return 0;
     const stmt = this.db.prepare(
       'DELETE FROM unresolved_refs WHERE from_node_id = ? AND reference_name = ? AND reference_kind = ?'
@@ -3251,6 +3323,7 @@ export class QueryBuilder {
    * created (#1269).
    */
   deleteReferencesByRowIds(rowIds: number[]): number {
+    this.bumpGraphGeneration();
     if (rowIds.length === 0) return 0;
     // One transaction for all chunks (each chunk was previously its own
     // implicit transaction = its own WAL commit — measurable on 100k+-ref
@@ -3462,6 +3535,7 @@ export class QueryBuilder {
 
   /** Delete edges by primary key — the rebind pass's half of a re-resolution. */
   deleteEdgesByIds(edgeIds: number[]): number {
+    this.bumpGraphGeneration();
     if (edgeIds.length === 0) return 0;
     let changed = 0;
     this.db.transaction(() => {
@@ -3622,6 +3696,7 @@ export class QueryBuilder {
    * Clear all data from the database
    */
   clear(): void {
+    this.bumpGraphGeneration();
     this.nodeCache.clear();
     this.db.transaction(() => {
       this.db.exec('DELETE FROM unresolved_refs');
