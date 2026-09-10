@@ -58,6 +58,7 @@ import { installMainThreadWatchdog, WatchdogHandle } from './liveness-watchdog';
 import { armStartupHandshakeTimeout } from './startup-handshake';
 import { treatStdinFailureAsShutdown } from './stdin-teardown';
 import { HOST_PPID_ENV } from '../extraction/wasm-runtime-flags';
+import { resolveDaemonV8Flags } from './memory-governor';
 
 /**
  * Env var that marks a process as the *detached daemon* itself (set by
@@ -206,7 +207,11 @@ function spawnDetachedDaemon(root: string): void {
     delete env[HOST_PPID_ENV];
     const child = spawn(
       process.execPath,
-      [...process.execArgv, scriptPath, 'serve', '--mcp', '--path', root],
+      // Heap caps first so a later duplicate in execArgv cannot override them.
+      // These make the memory budget structural: V8 cannot commit more old space
+      // than the cap, which is stronger than asking it to give pages back after
+      // the fact. See resolveDaemonV8Flags.
+      [...resolveDaemonV8Flags(), ...process.execArgv, scriptPath, 'serve', '--mcp', '--path', root],
       {
         detached: true,
         stdio,
