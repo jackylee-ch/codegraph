@@ -33,6 +33,20 @@ export default defineConfig({
        * they inject their own `env` via the Telemetry constructor.
        */
       CODEGRAPH_TELEMETRY: '0',
+      /**
+       * Request-time source parsing (the `WHEN` condition labels, call-argument
+       * shapes, and the Steps/Screens derivations that read call sites) is OFF by
+       * default in a shipped daemon: measured on flink it costs 76 MB of physical
+       * footprint, which is the difference between holding the 150 MB steady budget
+       * and missing it — see the note in `graph/branch-guards.ts`.
+       *
+       * The suite turns it ON because these tests exist to assert what the feature
+       * produces, and the feature is opt-in rather than removed. The DEFAULT is
+       * pinned separately, by `when-labels-switch.test.ts`, which clears the
+       * variable and re-imports — so flipping the shipped default cannot hide
+       * behind this line.
+       */
+      CODEGRAPH_WHEN_LABELS: '1',
     },
     coverage: {
       provider: 'v8',

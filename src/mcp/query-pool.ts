@@ -27,6 +27,7 @@ import { Worker } from 'worker_threads';
 import * as path from 'path';
 import * as os from 'os';
 import type { ToolResult } from './tools';
+import { resolveMemoryBudget } from './memory-governor';
 
 /** Compiled sibling — `query-worker.js` lives next to this file in `dist/mcp/`. */
 const WORKER_FILE = path.join(__dirname, 'query-worker.js');
@@ -50,6 +51,25 @@ const DEFAULT_BUSY_TIMEOUT_MS = 45_000; // < the ~60s MCP client request timeout
 
 /** Hard ceiling on pool size regardless of core count / env. */
 const MAX_POOL_SIZE = 16;
+
+/**
+ * Measured steady physical-footprint cost of one query worker, MB: 161.7 MB with the
+ * pool off against 200.7 MB with one worker, on flink. Used to decide how many the
+ * memory ceiling can afford.
+ */
+const WORKER_FOOTPRINT_MB = 39;
+
+/**
+ * Ceiling below which the pool stays off entirely, MB.
+ *
+ * A serving daemon on the largest repo measured here plateaus at ~131 MB of footprint
+ * with the pool off. One worker on top of that would be ~170 MB, which fits a 200 MB
+ * ceiling but leaves no room for the growth a real session's varied queries produce —
+ * and it buys no latency on the serial workload an agent actually generates. So the
+ * pool is treated as something to be afforded, not assumed: it switches on once the
+ * operator has raised the ceiling past the point where a worker is comfortable.
+ */
+const POOL_MIN_CEILING_MB = 400;
 
 /**
  * Total worker deaths before the pool declares itself unhealthy and the caller
@@ -140,19 +160,38 @@ export interface QueryPoolOptions {
 }
 
 /**
- * Resolve the pool size from the `CODEGRAPH_QUERY_POOL_SIZE` override and the
- * machine's core count. `0` (or a negative) explicitly disables the pool (the
- * caller serves in-process — today's behavior). Unset → `clamp(cores-1, 1, 16)`:
- * leave a core for the main loop + OS, but never zero, since even one worker
- * frees the transport and lets responses flush incrementally.
+ * Resolve the pool size from the `CODEGRAPH_QUERY_POOL_SIZE` override, the memory
+ * ceiling, and the machine's core count. `0` (or a negative) explicitly disables the
+ * pool and the caller serves in-process.
+ *
+ * **Sized by the memory budget first, cores second.** Every worker is a full
+ * `worker_threads` isolate with its own copy of the module graph and its OWN SQLite
+ * connection paying cache and mmap independently. Measured on flink, one worker cost
+ * **+39 MB of steady physical footprint** (161.7 -> 200.7 MB) and bought **nothing**
+ * in latency on a serial workload (721 ms vs 724 ms) — an agent drives one project
+ * one call at a time, so the pool's concurrency has nothing to overlap.
+ *
+ * The previous default was `clamp(cores-1, 1, 16)`, which on an 18-core machine is
+ * 16 workers — roughly 600 MB of workers under a 200 MB ceiling. That is the same
+ * class of defect as excluding the mmap window from the governed reading: a knob that
+ * can commit memory the budget cannot pay for. So the pool now switches on only when
+ * the operator has raised the ceiling enough to afford it.
  */
-export function resolvePoolSize(envVal: string | undefined, cpuCount: number): number {
+export function resolvePoolSize(
+  envVal: string | undefined,
+  cpuCount: number,
+  ceilingMb: number = resolveMemoryBudget().ceilingBytes / (1024 * 1024),
+): number {
   if (envVal !== undefined && envVal !== '') {
     const n = Number(envVal);
     if (Number.isFinite(n) && n >= 0) return Math.min(Math.floor(n), MAX_POOL_SIZE);
     // non-numeric / negative → fall through to the default
   }
-  return Math.max(1, Math.min(cpuCount - 1, MAX_POOL_SIZE));
+  // Below the affordability line, serve in-process: 39 MB per worker against a
+  // 200 MB ceiling is not a trade the budget can make.
+  if (ceilingMb < POOL_MIN_CEILING_MB) return 0;
+  const affordable = Math.floor((ceilingMb - POOL_MIN_CEILING_MB) / WORKER_FOOTPRINT_MB) + 1;
+  return Math.max(0, Math.min(cpuCount - 1, MAX_POOL_SIZE, affordable));
 }
 
 function resolveBusyTimeoutMs(): number {

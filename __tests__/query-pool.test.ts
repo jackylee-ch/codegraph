@@ -66,12 +66,31 @@ describe('resolvePoolSize', () => {
   it('caps the override at the hard ceiling', () => {
     expect(resolvePoolSize('999', 8)).toBe(16);
   });
-  it('defaults to clamp(cores-1, 1, 16) when unset/blank/non-numeric', () => {
-    expect(resolvePoolSize(undefined, 8)).toBe(7);
-    expect(resolvePoolSize('', 8)).toBe(7);
-    expect(resolvePoolSize('abc', 8)).toBe(7);
-    expect(resolvePoolSize(undefined, 1)).toBe(1);   // never zero
-    expect(resolvePoolSize(undefined, 64)).toBe(16); // never above the ceiling
+  it('defaults to OFF under the shipped ceiling, because a worker costs 39MB', () => {
+    // The default used to be clamp(cores-1, 1, 16) — on an 18-core machine, 16
+    // workers, each a full isolate with its own SQLite connection, i.e. roughly
+    // 600MB under a 200MB ceiling. Measured on flink, one worker cost +39MB of
+    // steady footprint (161.7 -> 200.7MB) and bought nothing in latency (721 vs
+    // 724ms), because an agent drives one project one call at a time and there is
+    // nothing for the pool's concurrency to overlap.
+    expect(resolvePoolSize(undefined, 8, 200)).toBe(0);
+    expect(resolvePoolSize('', 8, 200)).toBe(0);
+    expect(resolvePoolSize('abc', 8, 200)).toBe(0);
+  });
+
+  it('switches on once the ceiling can afford workers, and still respects cores', () => {
+    // Sized by the budget first, cores second: the count is what the headroom over
+    // the affordability line pays for, then clamped by cores-1 and the hard cap.
+    expect(resolvePoolSize(undefined, 8, 400)).toBe(1);
+    expect(resolvePoolSize(undefined, 8, 600)).toBe(6);   // (600-400)/39+1 = 6
+    expect(resolvePoolSize(undefined, 4, 2000)).toBe(3);  // cores-1 binds
+    expect(resolvePoolSize(undefined, 64, 4000)).toBe(16); // hard cap binds
+  });
+
+  it('lets an explicit override ask for workers the ceiling would not fund', () => {
+    // An operator saying a number is saying it on purpose; the budget's own
+    // enforcement (the governor) is what catches the consequence.
+    expect(resolvePoolSize('4', 8, 200)).toBe(4);
   });
 });
 

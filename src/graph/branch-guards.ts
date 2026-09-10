@@ -90,15 +90,26 @@ const JS_FAMILY: ReadonlySet<Language> = new Set(['typescript', 'javascript', 't
  * pages stay with the process.
  *
  * So a server that parses cannot hold a budget below that high-water, and the
- * only lever left is not to parse. Setting `CODEGRAPH_NO_WHEN_LABELS=1` trades the
- * `WHEN` condition labels for roughly 100 MB of steady footprint. Losing them is
+ * only lever left is not to parse. Measured on flink, the labels cost **76 MB of
+ * physical footprint** (200.3 MB without them against 276.4 MB with, same queries
+ * and same index), which is the difference between meeting a 200 MB ceiling and
+ * missing it by a third.
+ *
+ * **So request-time parsing is OFF by default**, and `CODEGRAPH_WHEN_LABELS=1` buys
+ * the labels back for anyone who would rather spend the 76 MB. Losing them is
  * already a supported state rather than a broken one — a language with no walk
- * rules yields no label, never a wrong one, which is the existing design.
+ * rules yields no label, never a wrong one, which is the existing design. That is
+ * what makes this a defensible default rather than a silent downgrade: the output
+ * shape does not change, one optional annotation is absent.
+ *
+ * `CODEGRAPH_NO_WHEN_LABELS=1` is still honoured so anything that set it keeps
+ * working, but it is now the default state rather than an opt-out.
  *
  * Read once: an operator does not change this mid-process, and the check sits on
  * the per-edge path.
  */
-const REQUEST_PARSE_DISABLED = process.env.CODEGRAPH_NO_WHEN_LABELS === '1';
+const REQUEST_PARSE_DISABLED =
+  process.env.CODEGRAPH_NO_WHEN_LABELS === '1' || process.env.CODEGRAPH_WHEN_LABELS !== '1';
 
 /** Whether this process will parse source at request time at all. */
 export function requestTimeParsingEnabled(): boolean {
