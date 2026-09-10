@@ -76,7 +76,7 @@ export {
   CODEGRAPH_DIR,
 } from './directory';
 export { IndexProgress, IndexResult, SyncResult } from './extraction';
-export { detectLanguage, isLanguageSupported, isGrammarLoaded, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './extraction';
+export { detectLanguage, isLanguageSupported, isGrammarLoaded, isTreeSitterRuntimeInitialized, getSupportedLanguages, initGrammars, loadGrammarsForLanguages, loadAllGrammars } from './extraction';
 export { ResolutionResult } from './resolution';
 export {
   CodeGraphError,
@@ -329,12 +329,34 @@ export class CodeGraph {
   /**
    * Open an existing CodeGraph project
    *
+   * Deliberately does NOT initialize the tree-sitter WASM runtime. A process that
+   * only ANSWERS QUERIES never parses — the query path reads rows out of SQLite —
+   * so bringing up `Parser.init()` here is work no query needs, on the startup
+   * path of every long-lived MCP daemon. `openSync()` has never initialized it
+   * and works fine, which is the existing proof that opening a project doesn't
+   * need it.
+   *
+   * Every path that actually parses goes through `loadGrammarsForLanguages()`,
+   * which calls `initGrammars()` itself when the runtime isn't up yet — so the
+   * runtime still comes up before the first parse, just on demand. The
+   * incremental sync only loads grammars when there are changed files to
+   * re-extract (see extraction/index.ts), which is exactly the condition under
+   * which it is needed. `init()` and `recreate()` still initialize eagerly:
+   * both go straight on to index, so deferring there would buy nothing.
+   *
+   * Measured caveat, recorded so nobody re-derives it wrong: the ~32 MB of
+   * `JSArrayBufferData` visible in a serve process's V8 heap snapshot is NOT this
+   * runtime — `process.memoryUsage().arrayBuffers` stays at 0 MB through
+   * `openSync()` and a query, so that 32 MB is the snapshot writer's own
+   * serialization buffer. The real size-proportional cost is in opening the
+   * database (heapUsed 18 MB → 117 MB on a 460k-node index), and most of it is
+   * collectable garbage rather than retained state.
+   *
    * @param projectRoot - Path to the project root directory
    * @param options - Open options
    * @returns A CodeGraph instance
    */
   static async open(projectRoot: string, options: OpenOptions = {}): Promise<CodeGraph> {
-    await initGrammars();
     const resolvedRoot = path.resolve(projectRoot);
 
     // Check if initialized
