@@ -250,6 +250,18 @@ export async function initGrammars(): Promise<void> {
 }
 
 /**
+ * Whether the tree-sitter WASM runtime has been brought up in this process.
+ *
+ * Exists so the "a query-only process never brings up the parser" invariant is
+ * testable: `CodeGraph.open()` deliberately no longer triggers `Parser.init()`,
+ * and only a path that actually parses (always via `loadGrammarsForLanguages`)
+ * should flip this to true. Read-only — nothing outside tests should branch on it.
+ */
+export function isTreeSitterRuntimeInitialized(): boolean {
+  return parserInitialized;
+}
+
+/**
  * Grammars that ship their own vendored WASMs under `dist/extraction/wasm/`
  * (not in tree-sitter-wasms, or the tree-sitter-wasms build is too old).
  * Lua: tree-sitter-wasms ships an ABI-13 build that corrupts the shared WASM
