@@ -57,6 +57,7 @@ import {
 import { CodeGraphPackageVersion } from './version';
 import { releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { registerDaemon, deregisterDaemon } from './daemon-registry';
+import { MemoryGovernor } from './memory-governor';
 
 /** Default idle linger after the last client disconnects. */
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
@@ -196,6 +197,38 @@ export class Daemon {
     // disables it here too.
     this.engine = new MCPEngine({ queryPool: true });
     this.engine.setProjectPathHint(projectRoot);
+    this.installMemoryGovernor();
+  }
+
+  /**
+   * Enforce the per-process memory budget.
+   *
+   * The daemon is the only layer that can own this policy: it knows what may be
+   * dropped (cross-project connections nothing is using) and it is the thing that
+   * can restart. The tool layer just calls `check()` when a request finishes.
+   *
+   * A ceiling breach exits gracefully rather than limping on. The next request
+   * spawns a fresh daemon — one cold start, against drifting past a budget the
+   * user set — and this also self-heals the class of leak a long-lived process
+   * accumulates over weeks, including a daemon still holding the index of a git
+   * worktree that has since been deleted.
+   */
+  private installMemoryGovernor(): void {
+    const handler = this.engine.getToolHandler();
+    const governor = new MemoryGovernor({
+      evict: () => handler.releaseCachedProjects(),
+      onCeiling: (reading) => {
+        process.stderr.write(
+          '[CodeGraph daemon] Memory ceiling reached ' +
+          `(${Math.round(reading.governedBytes / (1024 * 1024))}MB committed after reclaim); ` +
+          'restarting so the next request gets a clean process. ' +
+          'Raise CODEGRAPH_MEMORY_CEILING_MB if this project needs a bigger budget.\n'
+        );
+        void this.stop('memory ceiling');
+      },
+      log: (line) => process.stderr.write(`[CodeGraph daemon] memory ${line}\n`),
+    });
+    if (governor.enabled) handler.setMemoryGovernor(governor);
   }
 
   /**
