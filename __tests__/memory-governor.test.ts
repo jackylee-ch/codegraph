@@ -21,6 +21,7 @@ import {
   resolveMemoryBudget,
   MEMORY_BUDGET_DEFAULTS,
   captureRssBaseline,
+  resolveDaemonV8Flags,
   __resetGcHandleForTests,
   __setRssBaselineForTests,
   type MemoryBudget,
@@ -146,7 +147,58 @@ describe('getGcHandle', () => {
   });
 });
 
+describe('resolveDaemonV8Flags — the budget made structural', () => {
+  it('caps the daemon old space at a third of the ceiling', () => {
+    // A third, not the whole ceiling: the ceiling covers the whole process, and
+    // measured on a 460k-node index the JS side only ever committed ~58MB, so the
+    // rest of the budget belongs to native (sqlite page cache, malloc arenas,
+    // code space, page tables).
+    const flags = resolveDaemonV8Flags({ CODEGRAPH_MEMORY_CEILING_MB: '600' });
+    expect(flags).toContain('--max-old-space-size=200');
+    expect(flags).toContain('--max-semi-space-size=4');
+  });
+
+  it('floors the cap so V8 does not thrash on a large index', () => {
+    // Both knobs, because resolveMemoryBudget floors the ceiling just above the
+    // high-water mark — lowering only the ceiling leaves the default high water
+    // dominating it.
+    const flags = resolveDaemonV8Flags({
+      CODEGRAPH_MEMORY_HIGH_MB: '50',
+      CODEGRAPH_MEMORY_CEILING_MB: '60',
+    });
+    expect(flags).toContain('--max-old-space-size=48');
+  });
+
+  it('never hands V8 more than 1 GB just because the ceiling is huge', () => {
+    const flags = resolveDaemonV8Flags({ CODEGRAPH_MEMORY_CEILING_MB: '99999' });
+    expect(flags).toContain('--max-old-space-size=1024');
+  });
+
+  it('an explicit override wins over the derivation', () => {
+    const flags = resolveDaemonV8Flags({
+      CODEGRAPH_MEMORY_CEILING_MB: '600',
+      CODEGRAPH_DAEMON_HEAP_MB: '96',
+    });
+    expect(flags).toContain('--max-old-space-size=96');
+  });
+
+  it('CODEGRAPH_DAEMON_HEAP_MB=0 disables the flags entirely', () => {
+    expect(resolveDaemonV8Flags({ CODEGRAPH_DAEMON_HEAP_MB: '0' })).toEqual([]);
+  });
+
+  it('the governor kill switch also drops the flags', () => {
+    expect(resolveDaemonV8Flags({ CODEGRAPH_NO_MEMORY_GOVERNOR: '1' })).toEqual([]);
+  });
+
+  it('defaults produce a cap derived from the default ceiling', () => {
+    const flags = resolveDaemonV8Flags({});
+    const expected = Math.round(MEMORY_BUDGET_DEFAULTS.CEILING_MB / 3);
+    expect(flags).toContain(`--max-old-space-size=${expected}`);
+  });
+});
+
 describe('MemoryGovernor.check', () => {
+
   it('does nothing under the high-water mark — no evict, no gc', () => {
     let evicted = 0;
     const g = new MemoryGovernor(

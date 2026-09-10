@@ -205,9 +205,52 @@ export function getGcHandle(): (() => void) | null {
   return gcHandle;
 }
 
-/** Test seam: forget the memoized handle so a test can re-derive it. */
+/** Forget the memoized handle so a test can re-derive it. */
 export function __resetGcHandleForTests(): void {
   gcHandle = undefined;
+}
+
+/**
+ * V8 flags for the daemon's own spawn, derived from the memory budget.
+ *
+ * This is the one place a budget can be made STRUCTURAL rather than merely
+ * observed. `NODE_OPTIONS` cannot carry `--max-old-space-size` into a process the
+ * operator starts (it is allowlisted, and `--expose-gc` outright refuses), but the
+ * daemon is spawned by codegraph itself, so its `execArgv` is ours to set: V8 then
+ * physically cannot commit more old space than the cap, instead of being asked
+ * afterwards to give it back.
+ *
+ * The old-space cap is set to a fraction of the ceiling, not the ceiling itself,
+ * because the ceiling covers the whole process — V8's heap plus node:sqlite's page
+ * cache, its mmap window, code space and malloc arenas. Handing all of it to old
+ * space would guarantee the ceiling is breached by the JS heap alone.
+ *
+ * `--max-semi-space-size` is capped too: the young generation is committed up
+ * front, three spaces at a time, and on a query-serving process a large nursery
+ * buys nothing but resident bytes.
+ *
+ * An explicit `CODEGRAPH_DAEMON_HEAP_MB` wins; `0` disables the flags entirely.
+ */
+export function resolveDaemonV8Flags(
+  env: NodeJS.ProcessEnv = process.env,
+  budget: MemoryBudget = resolveMemoryBudget(env)
+): string[] {
+  const explicit = envPositiveNumber(env.CODEGRAPH_DAEMON_HEAP_MB);
+  if (env.CODEGRAPH_DAEMON_HEAP_MB !== undefined && explicit === undefined) return [];
+  if (!budget.enabled && explicit === undefined) return [];
+  const ceilingMb = budget.ceilingBytes / MB;
+  // A THIRD of the ceiling, not half. Measured on a 460k-node index with the
+  // ceiling at 200 MB: capping old space at 100 MB left V8 committing 56 MB and
+  // living in 19 MB, so the cap was never the constraint — the rest of the
+  // ceiling is native (node:sqlite page cache and malloc arenas, code space,
+  // page tables). Giving V8 a third leaves room for that and still sits well
+  // above what the JS side actually uses.
+  // Floored at 48 MB (below that V8 thrashes on a large index) and never above
+  // 1 GB (a huge ceiling should not imply an unbounded nursery).
+  const oldSpaceMb = Math.round(
+    Math.min(1024, Math.max(48, explicit ?? ceilingMb / 3))
+  );
+  return [`--max-old-space-size=${oldSpaceMb}`, '--max-semi-space-size=4'];
 }
 
 /** What the governor is allowed to do when memory is over the line. */
