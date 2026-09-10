@@ -73,6 +73,26 @@ export const EDGE_KINDS = [
 export type EdgeKind = (typeof EDGE_KINDS)[number];
 
 /**
+ * Edge kinds that make their source a "caller" of their target.
+ *
+ * `instantiates` counts because constructing a class (`Foo(...)` / `new Foo()`)
+ * is calling its constructor, so the construction site is a caller of the class
+ * — without it, `callers <Class>` surfaced only the importing file and missed
+ * every construction site, the opposite of "what breaks if I change this?" (#774).
+ *
+ * Shared so the traversal that LISTS callers and the aggregate that COUNTS them
+ * cannot drift apart: a count that used a different kind set than the listing
+ * would make two surfaces disagree about the same symbol.
+ */
+export const CALLER_EDGE_KINDS = [
+  'calls',
+  'references',
+  'imports',
+  'instantiates',
+  'navigates',
+] as const satisfies readonly EdgeKind[];
+
+/**
  * Supported programming languages. See NODE_KINDS for why this is a
  * runtime-iterable const array.
  */

@@ -1908,6 +1908,40 @@ export class QueryBuilder {
   }
 
   /**
+   * Distinct caller count for MANY nodes in one query, kind-filtered.
+   *
+   * Exactly the number `GraphTraverser.getCallers(id, 1).length` produces — the
+   * same edge kinds, deduped by source — but as a single `COUNT(DISTINCT source)`
+   * aggregate instead of materializing every caller row and then counting the
+   * array. Explore's centrality tiering asked for that count once per candidate,
+   * so a query naming an overloaded symbol hydrated every caller of every
+   * namesake purely to compare array lengths; on a symbol with hundreds of
+   * callers that is hundreds of full Node rows built and dropped per call, which
+   * is native allocation the memory budget then has to pay for.
+   *
+   * Ids with no matching incoming edges are absent from the map rather than
+   * present as 0, matching {@link countIncomingEdges}.
+   */
+  countDistinctCallers(ids: readonly string[], kinds: readonly string[]): Map<string, number> {
+    const out = new Map<string, number>();
+    if (ids.length === 0 || kinds.length === 0) return out;
+    const unique = [...new Set(ids)];
+    const kindPlaceholders = kinds.map(() => '?').join(',');
+    for (let i = 0; i < unique.length; i += SQLITE_PARAM_CHUNK_SIZE - kinds.length) {
+      const chunk = unique.slice(i, i + SQLITE_PARAM_CHUNK_SIZE - kinds.length);
+      const placeholders = chunk.map(() => '?').join(',');
+      const rows = this.db
+        .prepare(
+          `SELECT target, COUNT(DISTINCT source) AS count FROM edges ` +
+          `WHERE target IN (${placeholders}) AND kind IN (${kindPlaceholders}) GROUP BY target`
+        )
+        .all(...chunk, ...kinds) as Array<{ target: string; count: number }>;
+      for (const row of rows) out.set(row.target, row.count);
+    }
+    return out;
+  }
+
+  /**
    * Fan-in (total incoming edge count) for MANY nodes in one query.
    *
    * The per-node alternative — `getIncomingEdges(id).length` — is an indexed

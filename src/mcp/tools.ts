@@ -2215,6 +2215,21 @@ export class ToolHandler {
     this.worktreeMismatchCache.clear();
   }
 
+  /**
+   * Distinct caller counts for a set of nodes, or an empty map on any failure.
+   *
+   * Ranking must never fail a tool call: a missing count degrades the centrality
+   * tiering to "treat them all as 0", which is the same fallback the previous
+   * per-node try/catch produced.
+   */
+  private safeCallerCounts(cg: CodeGraph, ids: readonly string[]): Map<string, number> {
+    try {
+      return cg.getCallerCounts(ids);
+    } catch {
+      return new Map();
+    }
+  }
+
   /** Run one governor pass; never lets a bookkeeping problem fail a tool call. */
   private governMemory(): void {
     const governor = this.memoryGovernor;
@@ -3507,7 +3522,13 @@ export class ToolHandler {
       const SEEDABLE = new Set([...CALLABLE, 'variable', 'constant']);
       const isTestPath = (p: string) => /(^|\/)(tests?|specs?|__tests__|testdata|mocks?|fixtures?)\//i.test(p) || /\.(test|spec)\.[a-z]+$/i.test(p);
       const bodyLines = (n: Node) => Math.max(0, (n.endLine ?? n.startLine) - n.startLine);
-      const callerCount = (n: Node) => { try { return cg.getCallers(n.id).length; } catch { return 0; } };
+      // Counts come from one COUNT(DISTINCT source) aggregate over all candidates
+      // rather than getCallers().length per candidate: the count is all the
+      // centrality tiering below wants, and materializing every caller Node just
+      // to read `.length` was hundreds of objects built and dropped per candidate
+      // on a hub symbol. Same number, one query, no rows.
+      let callerCounts: Map<string, number> | null = null;
+      const callerCount = (n: Node) => callerCounts?.get(n.id) ?? 0;
       const tokens = [...new Set(
         matchQuery.split(/[\s,()[\]]+/)
           .map((t) => t.replace(FILE_EXT, '').trim())
@@ -3637,6 +3658,8 @@ export class ToolHandler {
           // within ~2x callers). EXCLUDE a vastly-less-central namesake (Go's
           // `NewClient`: real client 492 callers vs xds-pool 11, test-fake 3 →
           // ratio <0.025) so it doesn't fill the tier and crowd out the answer.
+          // One aggregate for this candidate set, not one traversal per candidate.
+          callerCounts = this.safeCallerCounts(cg, cands.map((c) => c.id));
           const counts = new Map(cands.map((c) => [c.id, callerCount(c)]));
           const maxCallers = Math.max(1, ...counts.values());
           tierPicks = cands.filter((c, i) => i === 0 || (counts.get(c.id) ?? 0) >= maxCallers * 0.25);

@@ -4,7 +4,7 @@
  * BFS and DFS traversal for the code knowledge graph.
  */
 
-import { Node, Edge, Subgraph, TraversalOptions, EdgeKind } from '../types';
+import { Node, Edge, Subgraph, TraversalOptions, EdgeKind, CALLER_EDGE_KINDS } from '../types';
 import { QueryBuilder } from '../db/queries';
 
 /**
@@ -292,7 +292,7 @@ export class GraphTraverser {
     // caller of the class. Without it, `callers <Class>` surfaced only the
     // importing file (via `imports`) and missed every construction site —
     // the opposite of "what breaks if I change this class?" (#774).
-    const incomingEdges = this.queries.getIncomingEdges(nodeId, ['calls', 'references', 'imports', 'instantiates', 'navigates']);
+    const incomingEdges = this.queries.getIncomingEdges(nodeId, [...CALLER_EDGE_KINDS]);
     if (incomingEdges.length === 0) return;
 
     // Batch-fetch all caller nodes in one round-trip instead of one
