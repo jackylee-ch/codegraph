@@ -24,6 +24,7 @@ import {
   BuildContextOptions,
   FindRelevantContextOptions,
   UnresolvedReference,
+  CALLER_EDGE_KINDS,
 } from './types';
 import { DatabaseConnection, getDatabasePath, removeDatabaseFiles } from './db';
 import { WalCheckpointValve, resolveWalValveMb } from './db/wal-valve';
@@ -1432,6 +1433,19 @@ export class CodeGraph {
    */
   getFanIn(ids: readonly string[]): Map<string, number> {
     return this.queries.countIncomingEdges(ids);
+  }
+
+  /**
+   * Distinct caller count for many nodes at once — the same number
+   * `getCallers(id).length` gives, without materializing the caller rows.
+   *
+   * Use this whenever the count is all that is wanted (centrality, ranking, a
+   * "N callers" note). `getCallers` builds a full `Node` per caller, so counting
+   * through it turns a ranking decision into hundreds of object allocations per
+   * candidate. See {@link QueryBuilder.countDistinctCallers}.
+   */
+  getCallerCounts(ids: readonly string[]): Map<string, number> {
+    return this.queries.countDistinctCallers(ids, CALLER_EDGE_KINDS);
   }
 
   /**
