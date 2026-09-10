@@ -57,7 +57,8 @@ import {
 import { CodeGraphPackageVersion } from './version';
 import { releaseWriterLock, tryAcquireWriterLock, writerLockHeldMessage } from './writer-lock';
 import { registerDaemon, deregisterDaemon } from './daemon-registry';
-import { MemoryGovernor } from './memory-governor';
+import { MemoryGovernor, captureRssBaseline, resolveMemoryBudget } from './memory-governor';
+import { memoryRestartSuppressed, recordMemoryRestart } from './memory-restart-record';
 
 /** Default idle linger after the last client disconnects. */
 const DEFAULT_IDLE_TIMEOUT_MS = 300_000;
@@ -214,21 +215,35 @@ export class Daemon {
    * worktree that has since been deleted.
    */
   private installMemoryGovernor(): void {
+    // Capture the resident baseline BEFORE the engine opens anything: everything
+    // above it is growth this process is responsible for, and the absolute number
+    // cannot be used because it includes the runtime's own mapped binary.
+    captureRssBaseline();
+    const budget = resolveMemoryBudget();
+    if (!budget.enabled) return;
+    // A restart already taken for this exact ceiling means the budget is below
+    // what a fresh process reaches — restarting again would just loop.
+    const suppressed = memoryRestartSuppressed(this.projectRoot, budget.ceilingBytes);
     const handler = this.engine.getToolHandler();
-    const governor = new MemoryGovernor({
-      evict: () => handler.releaseCachedProjects(),
-      onCeiling: (reading) => {
-        process.stderr.write(
-          '[CodeGraph daemon] Memory ceiling reached ' +
-          `(${Math.round(reading.governedBytes / (1024 * 1024))}MB committed after reclaim); ` +
-          'restarting so the next request gets a clean process. ' +
-          'Raise CODEGRAPH_MEMORY_CEILING_MB if this project needs a bigger budget.\n'
-        );
-        void this.stop('memory ceiling');
+    const governor = new MemoryGovernor(
+      {
+        evict: () => handler.releaseCachedProjects(),
+        onCeiling: (reading) => {
+          recordMemoryRestart(this.projectRoot, budget.ceilingBytes, reading.governedBytes);
+          process.stderr.write(
+            '[CodeGraph daemon] Memory ceiling reached ' +
+            `(${Math.round(reading.governedBytes / (1024 * 1024))}MB after reclaim); ` +
+            'restarting so the next request gets a clean process. ' +
+            'Raise CODEGRAPH_MEMORY_CEILING_MB if this project needs a bigger budget.\n'
+          );
+          void this.stop('memory ceiling');
+        },
+        log: (line) => process.stderr.write(`[CodeGraph daemon] memory ${line}\n`),
       },
-      log: (line) => process.stderr.write(`[CodeGraph daemon] memory ${line}\n`),
-    });
-    if (governor.enabled) handler.setMemoryGovernor(governor);
+      budget,
+      suppressed
+    );
+    handler.setMemoryGovernor(governor);
   }
 
   /**
