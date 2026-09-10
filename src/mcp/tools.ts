@@ -1303,14 +1303,67 @@ export function getStaticTools(): ToolDefinition[] {
 const DEFAULT_MCP_TOOLS = new Set(['explore']);
 
 /**
+ * Bounds on the cross-project connection cache.
+ *
+ * Every cached entry is a live SQLite connection, and `configureConnection`
+ * gives each one a 64 MB page cache plus a 256 MB mmap window (see
+ * ../db/index.ts). An unbounded cache therefore turns "an agent passed
+ * `projectPath` for eight repos in one session" into eight permanently-held
+ * connections — the daemon's resident set grows monotonically for its whole
+ * lifetime and only `closeAll()` ever releases any of it. That is the shape a
+ * month-long daemon cannot survive.
+ *
+ * Two independent bounds, because they fail differently:
+ *  - `MAX_PROJECTS` caps how many can be held at once (memory ceiling).
+ *  - `IDLE_TTL_MS` releases one nobody has touched in a long time even when the
+ *    count bound is nowhere near hit (a daemon idling on two repos overnight
+ *    should not still hold both).
+ *
+ * The DEFAULT project (`this.cg`) is owned by the server, is never stored here,
+ * and is never evicted — only extra `projectPath` targets are.
+ */
+export const PROJECT_CACHE_LIMITS = {
+  /** Extra cross-project connections held at once; least-recently-used evicted first. */
+  MAX_PROJECTS: 3,
+  /** Release a cached project untouched for this long (ms). */
+  IDLE_TTL_MS: 60 * 60 * 1000,
+} as const;
+
+/** Parse a positive-integer env override, or `undefined` for unset/malformed. */
+function envPositiveInt(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw.trim() === '') return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : undefined;
+}
+
+/** Resolved cache bounds, honoring `CODEGRAPH_PROJECT_CACHE_*` overrides. */
+export function resolveProjectCacheLimits(env: NodeJS.ProcessEnv = process.env): {
+  maxProjects: number;
+  idleTtlMs: number;
+} {
+  return {
+    maxProjects: envPositiveInt(env.CODEGRAPH_PROJECT_CACHE_SIZE) ?? PROJECT_CACHE_LIMITS.MAX_PROJECTS,
+    idleTtlMs: envPositiveInt(env.CODEGRAPH_PROJECT_CACHE_TTL_MS) ?? PROJECT_CACHE_LIMITS.IDLE_TTL_MS,
+  };
+}
+
+/** A cached cross-project connection plus the last time a tool call used it. */
+interface CachedProject {
+  cg: CodeGraph;
+  lastUsedMs: number;
+}
+
+/**
  * Tool handler that executes tools against a CodeGraph instance
  *
  * Supports cross-project queries via the projectPath parameter.
  * Other projects are opened on-demand and cached for performance.
  */
 export class ToolHandler {
-  // Cache of opened CodeGraph instances for cross-project queries
-  private projectCache: Map<string, CodeGraph> = new Map();
+  // Cache of opened CodeGraph instances for cross-project queries.
+  // Insertion-ordered: a hit re-inserts, so the head is always the LRU.
+  // Bounded by count AND idle age — see PROJECT_CACHE_LIMITS.
+  private projectCache: Map<string, CachedProject> = new Map();
   // The directory the server last searched for a default project. Surfaced in
   // the "not initialized" error so users can see why detection missed.
   private defaultProjectHint: string | null = null;
@@ -1624,12 +1677,74 @@ export class ToolHandler {
     // Cache the open DB connection by RESOLVED ROOT only — never by the input
     // path. One key per instance means closeAll() closes each exactly once, and
     // a changed resolution maps to a different entry instead of a stale hit.
+    //
+    // Bounded: every entry is a connection carrying a 64 MB page cache and a
+    // 256 MB mmap window, so the cache is swept for idle entries on every miss
+    // and trimmed to MAX_PROJECTS after every insert. Eviction closes the
+    // connection; a later call to the same project just reopens it.
+    const now = Date.now();
     const cached = this.projectCache.get(resolvedRoot);
-    if (cached) return this.freshen(cached);
+    if (cached) {
+      // Re-insert to mark most-recently-used (Map keeps insertion order).
+      this.projectCache.delete(resolvedRoot);
+      cached.lastUsedMs = now;
+      this.projectCache.set(resolvedRoot, cached);
+      return this.freshen(cached.cg);
+    }
 
+    this.sweepIdleProjects(now);
     const cg = loadCodeGraph().openSync(resolvedRoot);
-    this.projectCache.set(resolvedRoot, cg);
+    this.projectCache.set(resolvedRoot, { cg, lastUsedMs: now });
+    this.trimProjectCache();
     return cg;
+  }
+
+  /**
+   * Close cached projects nobody has touched within the idle TTL.
+   *
+   * Called on a cache MISS rather than from a timer: a repeating timer would
+   * hold the event loop open and defeat the daemon's own idle-exit, and a miss
+   * is exactly the moment we are about to add another connection anyway. A
+   * daemon that stops receiving tool calls stops sweeping — correct, because it
+   * is then on its way to exiting and releasing everything.
+   */
+  private sweepIdleProjects(now: number): void {
+    const { idleTtlMs } = resolveProjectCacheLimits();
+    if (idleTtlMs <= 0) return;
+    for (const [root, entry] of [...this.projectCache]) {
+      if (now - entry.lastUsedMs < idleTtlMs) continue;
+      this.projectCache.delete(root);
+      this.closeCached(entry, root, 'idle');
+    }
+  }
+
+  /** Evict least-recently-used projects until the count bound holds. */
+  private trimProjectCache(): void {
+    const { maxProjects } = resolveProjectCacheLimits();
+    while (this.projectCache.size > maxProjects) {
+      const lru = this.projectCache.keys().next().value as string | undefined;
+      if (lru === undefined) break;
+      const entry = this.projectCache.get(lru)!;
+      this.projectCache.delete(lru);
+      this.closeCached(entry, lru, 'lru');
+    }
+  }
+
+  /**
+   * Close an evicted connection. Never throws into a tool call: a close that
+   * fails would otherwise fail the request that merely happened to trigger
+   * eviction, and the entry is already out of the map either way.
+   */
+  private closeCached(entry: CachedProject, root: string, reason: 'idle' | 'lru'): void {
+    try {
+      entry.cg.close();
+    } catch {
+      // Best-effort — the entry is dropped regardless; a leaked handle is
+      // reclaimed when the daemon exits.
+    }
+    if (process.env.CODEGRAPH_MCP_DEBUG) {
+      process.stderr.write(`[CodeGraph MCP] released cached project (${reason}): ${root}\n`);
+    }
   }
 
   /**
@@ -1661,11 +1776,24 @@ export class ToolHandler {
    * Close all cached project connections
    */
   closeAll(): void {
-    for (const cg of this.projectCache.values()) {
-      cg.close();
+    for (const entry of this.projectCache.values()) {
+      try {
+        entry.cg.close();
+      } catch {
+        // Shutdown path — a failed close must not stop us closing the rest.
+      }
     }
     this.projectCache.clear();
     this.worktreeMismatchCache.clear();
+  }
+
+  /**
+   * Roots currently held in the cross-project cache, least-recently-used first.
+   * Exposed for tests and for the memory governor's accounting; callers must not
+   * mutate the returned array.
+   */
+  cachedProjectRoots(): string[] {
+    return [...this.projectCache.keys()];
   }
 
   /**
