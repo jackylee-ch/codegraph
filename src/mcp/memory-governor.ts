@@ -65,6 +65,16 @@ export interface MemoryReading {
   liveBytes: number;
   /** Absolute resident set, for reporting only — it includes clean mapped binary. */
   rssBytes: number;
+  /**
+   * Resident bytes that are NOT V8's heap, external or ArrayBuffer memory:
+   * node:sqlite's page cache and malloc arenas, V8 code space, thread stacks,
+   * page tables, and the runtime's own mapped binary.
+   *
+   * Broken out because it decides whether a budget is reachable at all. Neither
+   * eviction nor GC can touch it, so when it dominates, the answer is fewer
+   * processes / a smaller page cache / a different binding — not more collecting.
+   */
+  nativeBytes: number;
 }
 
 /** What `check()` decided to do. */
@@ -168,6 +178,7 @@ export function readMemory(): MemoryReading {
     rssGrowthBytes,
     liveBytes: h.used_heap_size,
     rssBytes: m.rss,
+    nativeBytes: Math.max(0, m.rss - m.heapTotal - m.external - m.arrayBuffers),
   };
 }
 
@@ -353,7 +364,9 @@ export class MemoryGovernor {
       `reclaim: governed ${fmtMb(before.governedBytes)} -> ${fmtMb(after.governedBytes)} ` +
       `(js ${fmtMb(before.committedJsBytes)} -> ${fmtMb(after.committedJsBytes)}, ` +
       `rss+ ${fmtMb(before.rssGrowthBytes)} -> ${fmtMb(after.rssGrowthBytes)}, ` +
-      `live ${fmtMb(before.liveBytes)} -> ${fmtMb(after.liveBytes)}, rss ${fmtMb(after.rssBytes)}), ` +
+      `live ${fmtMb(before.liveBytes)} -> ${fmtMb(after.liveBytes)}, ` +
+      `native ${fmtMb(before.nativeBytes)} -> ${fmtMb(after.nativeBytes)}, ` +
+      `rss ${fmtMb(after.rssBytes)}), ` +
       `high ${fmtMb(this.budget.highWaterBytes)} ceiling ${fmtMb(this.budget.ceilingBytes)}` +
       (gc ? '' : ' [no gc handle]')
     );
