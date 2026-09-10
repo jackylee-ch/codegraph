@@ -44,8 +44,26 @@ export { SqliteDatabase, SqliteBackend } from './sqlite-adapter';
  * env override hides behind plain megabytes. `mmap_size = 0` disables mmap.
  */
 export const CONNECTION_MEMORY_DEFAULTS = {
-  CACHE_MB: 64,
-  MMAP_MB: 256,
+  /**
+   * Page cache, MB. Real charged memory — it lives in malloc arenas (measured:
+   * `MALLOC_SMALL` 104.9 MB dirty with a 64 MB cache). Turning it down is the one
+   * SQLite knob that genuinely reduces a serving process's footprint.
+   */
+  CACHE_MB: 16,
+  /**
+   * Memory-mapped window, MB. **Nearly free, and worth a lot of latency.**
+   *
+   * Measured with 1 GB mapped on a 1.4 GB index: `vmmap` reports 656 MB resident
+   * and **0 KB dirty**, and the process's physical footprint (304.6 MB) excludes
+   * it entirely — clean, file-backed page cache the kernel drops at zero cost.
+   * Meanwhile it is worth 30–57% of query latency: median 2034 ms at mmap=0 vs
+   * 1226 ms at mmap=2048 on the same four queries against the same index.
+   *
+   * Raised from 256 to 2048 for exactly that reason. Above the database's own
+   * size there is nothing left to map, so this is effectively "map the whole
+   * index" for anything up to a 2 GB DB.
+   */
+  MMAP_MB: 2048,
   /** `temp_store`: 'MEMORY' keeps sorters/temp b-trees in RAM, 'FILE' spills them. */
   TEMP_STORE: 'MEMORY' as 'MEMORY' | 'FILE',
   /**
