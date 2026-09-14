@@ -111,6 +111,8 @@ const parentPid = Number(process.argv[1]);
 const timeoutMs = Number(process.argv[2]);
 const capMs = Number(process.argv[3]);
 const progressPaths = process.argv.slice(4);
+// Hide the inline script in process listings while keeping the monitored PID visible.
+try { process.title = 'codegraph:watchdog parent=' + parentPid; } catch (e) {}
 const secs = Math.round(timeoutMs / 1000);
 function kill(extra) {
   // Timestamped so daemon.log kills can be correlated with anything (#1431) —

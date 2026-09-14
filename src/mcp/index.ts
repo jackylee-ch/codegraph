@@ -265,6 +265,15 @@ export class MCPServer {
     this.projectPath = projectPath || null;
   }
 
+  /** Keep process listings readable without changing argv used to spawn the daemon. */
+  private setProcessTitle(role: 'mcp' | 'proxy' | 'daemon', root: string | null): void {
+    try {
+      const project = path.resolve(root ?? this.projectPath ?? process.cwd());
+      const repo = (path.basename(project) || project).replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 80);
+      process.title = `codegraph:${role} repo=${repo}`;
+    } catch { /* Process titles are cosmetic; never prevent a server from starting. */ }
+  }
+
   /**
    * Start the MCP server.
    *
@@ -318,6 +327,7 @@ export class MCPServer {
       // Runs until the host disconnects; the proxy installs its own watchdog and
       // falls back to an in-process engine if the daemon never comes up.
       this.mode = 'proxy';
+      this.setProcessTitle('proxy', root);
       await this.runProxyWithLocalHandshake(root);
       return;
     } catch (err) {
@@ -374,6 +384,7 @@ export class MCPServer {
     // #1740: refuse a second direct writer on an initialized project. Daemon
     // mode multiplexes clients; direct mode is single-writer-per-project.
     const writerRoot = resolveDaemonRoot(this.projectPath);
+    this.setProcessTitle('mcp', writerRoot);
     if (writerRoot) {
       const writer = tryAcquireWriterLock(writerRoot, 'direct');
       if (writer.kind === 'taken') {
@@ -436,6 +447,7 @@ export class MCPServer {
     // kills/restarts can be placed in time (#1431 — the log was undatable).
     timestampStderrLines();
     const root = resolveDaemonRoot(this.projectPath) ?? this.projectPath ?? process.cwd();
+    this.setProcessTitle('daemon', root);
     for (let attempt = 0; attempt < TAKEOVER_MAX_RETRIES; attempt++) {
       const lock = tryAcquireDaemonLock(root);
 
